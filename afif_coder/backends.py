@@ -109,9 +109,9 @@ def list_models(provider_id: str, cfg: dict) -> list[str]:
         r = HTTP.get(f"{base}/models", timeout=20, headers={"Authorization": f"Bearer {key}"} if key else {})
         _raise_for(r, p.label)
         ids = [m.get("id", "").removeprefix("models/") for m in r.json().get("data", [])]
-        if provider_id == "gemini":     # keep chat models only
-            skip = ("embedding", "image", "tts", "imagen", "veo", "aqa", "audio", "live", "robotics", "learnlm")
-            ids = [i for i in ids if i.startswith("gemini") and not any(s in i for s in skip)]
+        if provider_id == "gemini":     # keep chat models that can use tools
+            ids = [i for i in ids if gemini_chat_model(i)]
+            return sorted(ids, key=gemini_rank)
         return sorted(i for i in ids if i)
     except requests.ConnectionError:
         raise BackendError(f"Can't reach {p.label}. Check your internet connection.")
@@ -124,6 +124,25 @@ def _unwrap(j):
     while isinstance(j, list):
         j = j[0] if j else {}
     return j if isinstance(j, dict) else {"message": str(j)}
+
+
+GEMINI_SKIP = ("embedding", "image", "tts", "imagen", "veo", "aqa", "audio", "live", "robotics", "learnlm",
+               "computer-use", "computer_use", "banana", "native", "exp-", "gemma", "lyria", "vision")
+
+
+def gemini_chat_model(model_id: str) -> bool:
+    """Gemini's list includes special models (computer use, image, speech…) that can't chat with tools."""
+    i = model_id.lower()
+    return i.startswith("gemini") and not any(s in i for s in GEMINI_SKIP)
+
+
+def gemini_rank(model_id: str):
+    """Newest first; within a version: Flash, Pro, then Lite; stable before preview."""
+    import re as _re
+    m = _re.search(r"gemini-(\d+(?:\.\d+)?)", model_id)
+    ver = float(m.group(1)) if m else 0
+    kind = 0 if "flash" in model_id and "lite" not in model_id else (1 if "pro" in model_id else 2)
+    return (-ver, kind, "preview" in model_id, model_id)
 
 
 def _raise_for(r, label: str):

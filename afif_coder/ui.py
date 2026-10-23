@@ -709,6 +709,9 @@ class MainWindow(QMainWindow):
                 names = [n.strip() for n in cfg["pinned"].split(",") if n.strip()]
             else:
                 names = cfg.get("models") or list(p.defaults)
+            if pid == "gemini":                    # hide special models saved by older versions
+                from .backends import gemini_chat_model, gemini_rank
+                names = sorted([n for n in names if gemini_chat_model(n)], key=gemini_rank) or list(p.defaults)
             for m in names[:60]:
                 out.append((f"{pretty_model(pid, m)}  ·  {p.label if not p.custom else 'cloud'}", f"cloud:{pid}:{m}"))
         return out
