@@ -48,7 +48,7 @@ def has_both(release):
     return pick(release, "cpu") and pick(release, "vulkan")
 
 
-rel = next((x for x in r.json() if not x.get("draft") and not x.get("prerelease") and has_both(x)), None)
+rel = next((x for x in r.json() if not x.get("draft") and has_both(x)), None)   # numbered builds are marked pre-release
 if not rel:
     first = r.json()[0]
     note("error", f"No Windows CPU + Vulkan builds found. Files in {first['tag_name']}: "
