@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .agent import Agent, extract_text_calls
+from .attachments import Attachment, build_message, from_image_bytes, load as load_attachment
+from .backends import PROVIDERS, BackendError, LocalBackend, make_backend, unprotect
 from .engine import Engine
 from .models import Downloader, ModelsDialog, display_name, installed_models
 from .paths import data_dir
@@ -29,8 +31,28 @@ KIND = {  # tool name -> label shown in the transcript
 
 DEFAULTS = {
     "model": "", "num_ctx": 16384, "temperature": 0.2, "use_gpu": True,
-    "max_steps": 40, "theme": "system", "project": "", "recent": [], "extra_models": [],
+    "max_steps": 40, "theme": "system", "project": "", "recent": [], "extra_models": [], "cloud": {},
 }
+
+
+def pretty_model(pid: str, model: str) -> str:
+    """claude-sonnet-5-5 -> Claude Sonnet 5.5, gemini-3.8-flash -> Gemini 3.8 Flash."""
+    if pid == "custom":
+        return model
+    words, out, i = model.split("-"), [], 0
+    brand = {"claude": "Claude", "gemini": "Gemini", "deepseek": "DeepSeek"}
+    while i < len(words):
+        w = words[i]
+        if w.isdigit() and len(w) == 8:                       # date suffix
+            i += 1
+            continue
+        if w.isdigit() and i + 1 < len(words) and words[i + 1].isdigit() and len(words[i + 1]) <= 2:
+            out.append(f"{w}.{words[i + 1]}")
+            i += 2
+            continue
+        out.append(brand.get(w, w if any(c.isdigit() for c in w) else w.capitalize()))
+        i += 1
+    return " ".join(out)
 MANAGE = "Manage models…"
 
 
@@ -57,7 +79,7 @@ def save_settings(s: dict):
 
 # ---------------------------------------------------------------- transcript blocks
 class UserBlock(QFrame):
-    def __init__(self, text: str):
+    def __init__(self, text: str, files: list | None = None):
         super().__init__()
         self.setObjectName("userMsg")
         lay = QVBoxLayout(self)
@@ -65,12 +87,19 @@ class UserBlock(QFrame):
         lay.setSpacing(2)
         who = QLabel("You")
         who.setObjectName("who")
-        body = QLabel(text)
-        body.setObjectName("userText")
-        body.setWordWrap(True)
-        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(who)
-        lay.addWidget(body)
+        if text:
+            body = QLabel(text)
+            body.setObjectName("userText")
+            body.setWordWrap(True)
+            body.setTextFormat(Qt.PlainText)
+            body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lay.addWidget(body)
+        if files:
+            att = QLabel("Attached: " + ", ".join(f"{a.name} ({a.note})" if a.note else a.name for a in files))
+            att.setObjectName("muted")
+            att.setWordWrap(True)
+            lay.addWidget(att)
 
 
 class ReplyBlock(QTextBrowser):
@@ -261,6 +290,27 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------- composer
 class Composer(QPlainTextEdit):
     submit = Signal()
+    files_added = Signal(list)          # local file paths
+    image_pasted = Signal(bytes)        # PNG bytes
+
+    def canInsertFromMimeData(self, md):
+        return md.hasImage() or md.hasUrls() or super().canInsertFromMimeData(md)
+
+    def insertFromMimeData(self, md):
+        if md.hasImage():
+            from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+            img = md.imageData()
+            ba = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QIODevice.WriteOnly)
+            img.save(buf, "PNG")
+            self.image_pasted.emit(bytes(ba))
+            return
+        files = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md.hasUrls() else []
+        if files:
+            self.files_added.emit(files)
+            return
+        super().insertFromMimeData(md)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Return, Qt.Key_Enter) and not (e.modifiers() & Qt.ShiftModifier):
@@ -276,8 +326,12 @@ class MainWindow(QMainWindow):
         self.s = load_settings()
         self.engine = Engine()
         self.dl = Downloader()
-        self.agent = Agent(self.s, lambda: self.engine.url)
+        self.agent = Agent(self.s, self._backend)
         self.busy = False
+        self.sel = ""                     # "local:<path>" or "cloud:<provider>:<model>"
+        self.pending: list[Attachment] = []
+        self.last_usage = (0, 0)
+        self.setAcceptDrops(True)
         self.reply: ReplyBlock | None = None
         self.reply_buf = ""
         self.tools: dict[str, ToolBlock] = {}
@@ -297,7 +351,7 @@ class MainWindow(QMainWindow):
             self.open_project(self.s["project"])
         else:
             self.stack.setCurrentIndex(0)
-        if not installed_models(self.s["extra_models"]):
+        if not installed_models(self.s["extra_models"]) and not self._cloud_choices():
             QTimer.singleShot(400, self.open_models)    # first run: get a model
 
     # ---------- layout ----------
@@ -390,15 +444,28 @@ class MainWindow(QMainWindow):
         b.setContentsMargins(24, 4, 24, 14)
         b.setSpacing(6)
         comp = QFrame(objectName="composer")
-        c = QHBoxLayout(comp)
-        c.setContentsMargins(10, 8, 8, 8)
+        cv = QVBoxLayout(comp)
+        cv.setContentsMargins(10, 8, 8, 8)
+        cv.setSpacing(4)
+        self.chips = QWidget()
+        self.chips_lay = QHBoxLayout(self.chips)
+        self.chips_lay.setContentsMargins(0, 0, 0, 0)
+        self.chips_lay.setSpacing(6)
+        self.chips.setVisible(False)
+        cv.addWidget(self.chips)
         self.input = Composer(objectName="input")
         self.input.setPlaceholderText("Describe what to build or fix…  (Enter to send, Shift+Enter for a new line)")
-        self.input.setFixedHeight(68)
+        self.input.setFixedHeight(64)
+        cv.addWidget(self.input)
+        row = QHBoxLayout()
+        self.attach = QPushButton("Attach files", objectName="flat")
+        self.attach.setToolTip("Attach files, or drag them onto the window, or paste an image")
         self.send = QPushButton("Send", objectName="primary")
         self.send.setFixedWidth(84)
-        c.addWidget(self.input, 1)
-        c.addWidget(self.send, 0, Qt.AlignBottom)
+        row.addWidget(self.attach)
+        row.addStretch(1)
+        row.addWidget(self.send)
+        cv.addLayout(row)
         b.addWidget(comp)
         foot = QHBoxLayout()
         self.auto = QCheckBox("Allow edits and commands without asking")
@@ -422,6 +489,9 @@ class MainWindow(QMainWindow):
         self.set_btn.clicked.connect(self.open_settings)
         self.send.clicked.connect(self._send_or_stop)
         self.input.submit.connect(self._send_or_stop)
+        self.input.files_added.connect(self.add_files)
+        self.input.image_pasted.connect(lambda png: self._add_attachment(from_image_bytes(png)))
+        self.attach.clicked.connect(self._pick_files)
         self.auto.toggled.connect(lambda on: setattr(self.agent, "auto_approve", on))
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self.new_chat)
         QShortcut(QKeySequence("Ctrl+O"), self, activated=self.choose_project)
@@ -434,6 +504,7 @@ class MainWindow(QMainWindow):
         a.tool_finished.connect(self._on_tool_done)
         a.approval_needed.connect(self._on_approval)
         a.status.connect(self.status.setText)
+        a.usage.connect(lambda i, o: setattr(self, "last_usage", (i, o)))
         a.finished.connect(self._on_finished)
 
     # ---------- theme ----------
@@ -497,52 +568,105 @@ class MainWindow(QMainWindow):
         self.input.setFocus()
 
     # ---------- models ----------
+    def _cloud_choices(self) -> list[tuple[str, str]]:
+        out = []
+        for pid, cfg in (self.s.get("cloud") or {}).items():
+            p = PROVIDERS.get(pid)
+            if not p or not (cfg.get("key") or (p.custom and cfg.get("base_url"))):
+                continue
+            if p.custom and cfg.get("pinned"):
+                names = [n.strip() for n in cfg["pinned"].split(",") if n.strip()]
+            else:
+                names = cfg.get("models") or list(p.defaults)
+            for m in names[:60]:
+                out.append((f"{pretty_model(pid, m)}  ·  {p.label if not p.custom else 'cloud'}", f"cloud:{pid}:{m}"))
+        return out
+
     def refresh_models(self, start: bool = False):
         paths = installed_models(self.s["extra_models"])
+        clouds = self._cloud_choices()
         want = self.s.get("model", "")
+        if want and not want.startswith(("local:", "cloud:")):
+            want = "local:" + want                       # settings from 1.0
         self.model.blockSignals(True)
         self.model.clear()
-        for p in paths:
-            self.model.addItem(display_name(p), str(p))
-        self.model.addItem(MANAGE, "")
-        strs = [str(p) for p in paths]
-        if want not in strs and strs:
-            want = strs[-1] if len(strs) == 1 else strs[0]
-        if want in strs:
-            self.model.setCurrentIndex(strs.index(want))
+
+        def header(text):
+            self.model.addItem(text, None)
+            self.model.model().item(self.model.count() - 1).setEnabled(False)
+
+        if paths:
+            header("On this PC: free, offline")
+            for p in paths:
+                self.model.addItem("   " + display_name(p), "local:" + str(p))
+        if clouds:
+            header("Cloud: billed to your API key")
+            for label, data in clouds:
+                self.model.addItem("   " + label, data)
+        self.model.addItem(MANAGE, "manage")
+        choices = [self.model.itemData(i) for i in range(self.model.count())]
+        choices = [d for d in choices if d and d != "manage"]
+        if want not in choices:
+            want = choices[0] if choices else ""
+        if want:
+            self.model.setCurrentIndex(self.model.findData(want))
+        else:
+            self.model.setCurrentIndex(self.model.count() - 1)
         self.model.blockSignals(False)
-        if want in strs and (start or want != self.engine.model or self.engine.current in ("off", "failed")):
-            self._load(want)
-        elif not strs:
+        if want:
+            self._select(want, force=start)
+        else:
+            self.sel = ""
             self.engine.stop()
             self.s["model"] = ""
+            self._on_engine("off", "")
 
     def _model_changed(self, _name: str):
-        path = self.model.currentData()
-        if not path:                      # "Manage models…"
+        data = self.model.currentData()
+        if data == "manage":
             self.refresh_models()
             self.open_models()
             return
-        self._load(path)
+        if data:
+            self._select(data)
 
-    def _load(self, path: str):
-        self.s["model"] = path
+    def _select(self, data: str, force: bool = False):
+        self.s["model"] = data
         save_settings(self.s)
-        if self.engine.model == path and self.engine.current in ("loading", "ready"):
+        if data.startswith("local:"):
+            self.sel = data
+            self._load(data[6:], force)
+            return
+        if self.sel == data and not force:
+            return
+        self.sel = data
+        self.engine.stop()                     # free the PC's memory while using the cloud
+        _, pid, model = data.split(":", 2)
+        p = PROVIDERS[pid]
+        self._set_dot("true", "Cloud", f"{pretty_model(pid, model)} via {p.label}. {p.note}")
+        self.status.setText(f"Using {pretty_model(pid, model)} in the cloud. Messages are billed to your {p.label} key.")
+
+    def _load(self, path: str, force: bool = False):
+        if not force and self.engine.model == path and self.engine.current in ("loading", "ready"):
             return
         self.engine.model = path
         self.engine.start(path, int(self.s["num_ctx"]), bool(self.s["use_gpu"]))
 
-    def _on_engine(self, state: str, detail: str):
-        colours = {"ready": "true", "loading": "wait", "failed": "false", "off": "false"}
-        self.dot.setProperty("on", colours[state])
+    def _set_dot(self, on: str, text: str, tip: str):
+        self.dot.setProperty("on", on)
         self.dot.style().unpolish(self.dot)
         self.dot.style().polish(self.dot)
+        self.conn.setText(text)
+        self.conn.setToolTip(tip)
+        self.dot.setToolTip(tip)
+
+    def _on_engine(self, state: str, detail: str):
+        if self.sel.startswith("cloud:"):
+            return                             # the engine is idle while a cloud model is chosen
+        colours = {"ready": "true", "loading": "wait", "failed": "false", "off": "false"}
         text = {"ready": "Ready", "loading": "Loading model…", "failed": "Engine error",
                 "off": "No model loaded"}[state]
-        self.conn.setText(text)
-        self.conn.setToolTip(detail)
-        self.dot.setToolTip(detail)
+        self._set_dot(colours[state], text, detail)
         if state == "failed":
             self.engine.model = ""
             self.status.setText(detail)
@@ -551,10 +675,30 @@ class MainWindow(QMainWindow):
         elif state == "loading":
             self.status.setText(detail)
 
-    def open_models(self):
-        dlg = ModelsDialog(self.dl, self.s, lambda p: str(p) == self.engine.model, self)
+    def _backend(self):
+        """Called by the agent (worker thread) at the start of each message."""
+        sel = self.sel
+        if sel.startswith("cloud:"):
+            _, pid, model = sel.split(":", 2)
+            cfg = dict((self.s.get("cloud") or {}).get(pid) or {})
+            cfg["key"] = unprotect(cfg.get("key", ""))
+            return make_backend(pid, model, cfg)
+        if self.engine.current != "ready":
+            raise BackendError("The local model isn't loaded yet.")
+        return LocalBackend(self.engine.url)
+
+    def _sees_images(self) -> bool:
+        if not self.sel.startswith("cloud:"):
+            return False
+        pid = self.sel.split(":", 2)[1]
+        cfg = (self.s.get("cloud") or {}).get(pid) or {}
+        return bool(cfg.get("vision", PROVIDERS[pid].vision))
+
+    def open_models(self, tab: int = 0):
+        dlg = ModelsDialog(self.dl, self.s, lambda p: self.sel == "local:" + str(p), self, tab=tab)
         dlg.changed.connect(lambda: (save_settings(self.s), self.refresh_models()))
         dlg.exec()
+        save_settings(self.s)
         self.refresh_models()
 
     def open_settings(self):
@@ -564,9 +708,53 @@ class MainWindow(QMainWindow):
             self.s.update(dlg.values())
             save_settings(self.s)
             self.apply_theme()
-            if old != (self.s["use_gpu"], self.s["num_ctx"]) and self.s.get("model"):
-                self.engine.model = ""
-                self._load(self.s["model"])
+            if old != (self.s["use_gpu"], self.s["num_ctx"]) and self.sel.startswith("local:"):
+                self._load(self.sel[6:], force=True)
+
+    # ---------- attachments ----------
+    def _pick_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Attach files", self.s.get("project") or str(Path.home()),
+                                                "All files (*);;Documents (*.pdf *.docx *.xlsx *.txt *.md *.csv);;"
+                                                "Images (*.png *.jpg *.jpeg *.gif *.webp)")
+        self.add_files(files)
+
+    def add_files(self, files: list):
+        for f in files:
+            if Path(f).is_file():
+                self._add_attachment(load_attachment(f))
+            elif Path(f).is_dir():
+                self.status.setText(f"{Path(f).name} is a folder. To work on a folder, open it as the project.")
+
+    def _add_attachment(self, a: Attachment):
+        if len(self.pending) >= 12:
+            self.status.setText("Up to 12 files per message.")
+            return
+        self.pending.append(a)
+        self._render_chips()
+        if a.kind == "error":
+            self.status.setText(f"{a.name}: {a.note}")
+        elif a.kind == "image" and not self._sees_images():
+            self.status.setText("This model can't see images. Pick a cloud model like Claude or Gemini to send pictures.")
+
+    def _render_chips(self):
+        while self.chips_lay.count():
+            w = self.chips_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        for a in self.pending:
+            chip = QPushButton(f"{a.name}  ×", objectName="chip")
+            chip.setToolTip(f"{a.note}. Click to remove." if a.note else "Click to remove.")
+            chip.clicked.connect(lambda _=False, a=a: (self.pending.remove(a), self._render_chips()))
+            self.chips_lay.addWidget(chip)
+        self.chips_lay.addStretch(1)
+        self.chips.setVisible(bool(self.pending))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() and self.stack.currentIndex() == 1:
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        self.add_files([u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()])
 
     # ---------- sending ----------
     def _send_or_stop(self):
@@ -575,19 +763,27 @@ class MainWindow(QMainWindow):
             self.status.setText("Stopping…")
             return
         text = self.input.toPlainText().strip()
-        if not text:
+        if not text and not self.pending:
             return
-        if self.engine.current != "ready":
+        if not self.sel:
+            self.status.setText("Choose a model first (Manage models…).")
+            self.open_models()
+            return
+        if self.sel.startswith("local:") and self.engine.current != "ready":
             self.status.setText({"loading": "The model is still loading. Try again in a moment.",
                                  "failed": "The engine couldn't start. " + self.conn.toolTip()}.get(
-                self.engine.current, "Download or choose a model first (Manage models…)."))
-            if self.engine.current == "off":
-                self.open_models()
+                self.engine.current, "The local model isn't loaded."))
             return
+        files, self.pending = self.pending, []
+        self._render_chips()
+        content = build_message(text, files, self.s["project"])
         self.input.clear()
-        self._add(UserBlock(text))
+        self._add(UserBlock(text, files))
+        self.last_usage = (0, 0)
         self._set_busy(True)
-        threading.Thread(target=self.agent.run, args=(text,), daemon=True).start()
+        if any(a.kind == "image" for a in files) and not self._sees_images():
+            self.status.setText("Sent without the images: this model can't see pictures.")
+        threading.Thread(target=self.agent.run, args=(content,), daemon=True).start()
 
     def _set_busy(self, on: bool):
         self.busy = on
@@ -595,7 +791,7 @@ class MainWindow(QMainWindow):
         self.send.setObjectName("danger" if on else "primary")
         self.send.style().unpolish(self.send)
         self.send.style().polish(self.send)
-        for w in (self.model, self.new_btn, self.project_btn, self.set_btn):
+        for w in (self.model, self.new_btn, self.project_btn, self.set_btn, self.attach):
             w.setEnabled(not on)
 
     def _add(self, w: QWidget):
@@ -664,7 +860,9 @@ class MainWindow(QMainWindow):
     def _on_finished(self, err: str):
         self._flush_reply()
         self._set_busy(False)
-        self.status.setText(err or "Done")
+        tin, tout = self.last_usage
+        used = f"  ·  {tin:,} tokens in, {tout:,} out" if (tin or tout) else ""
+        self.status.setText((err or "Done") + used)
         if err and err != "Stopped.":
             note = ReplyBlock(self.css)
             note.set_text(f"**Couldn't finish.** {err}")

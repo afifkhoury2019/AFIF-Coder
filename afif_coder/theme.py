@@ -101,6 +101,14 @@ QPlainTextEdit#input {{ background: transparent; border: none; font-size: 10.5pt
 QProgressBar {{ background: {t['line']}; border: none; border-radius: 3px; }}
 QProgressBar::chunk {{ background: {t['accent']}; border-radius: 3px; }}
 QMessageBox {{ background: {t['paper']}; }}
+QPushButton#chip {{ background: {t['tint']}; border: 1px solid {t['line']}; border-radius: 12px;
+                   padding: 2px 10px; font-size: 9pt; }}
+QPushButton#chip:hover {{ border-color: {t['bad']}; }}
+QTabWidget::pane {{ border: none; }}
+QTabBar::tab {{ background: transparent; padding: 6px 14px; border: none; color: {t['steel']};
+               border-bottom: 2px solid transparent; }}
+QTabBar::tab:selected {{ color: {t['ink']}; border-bottom: 2px solid {t['accent']}; }}
+QTabBar::tab:hover {{ color: {t['ink']}; }}
 QDialog {{ background: {t['paper']}; }}
 """
 

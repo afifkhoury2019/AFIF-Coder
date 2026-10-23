@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from PySide6.QtCore import QCoreApplication  # noqa: E402
 
 from afif_coder.agent import Agent  # noqa: E402
+from afif_coder.backends import LocalBackend  # noqa: E402
 from afif_coder.engine import Engine  # noqa: E402
 
 app = QCoreApplication([])
@@ -30,7 +31,7 @@ print(f"engine ready in {time.time() - t0:.1f}s on port {eng.port}")
 
 proj = Path(tempfile.mkdtemp())
 (proj / "calc.py").write_text("def add(a, b):\n    return a - b\n\nprint(add(2, 3))\n")
-agent = Agent({"temperature": 0.0, "max_steps": 12}, lambda: eng.url)
+agent = Agent({"temperature": 0.0, "max_steps": 12}, lambda: LocalBackend(eng.url))
 agent.reset(str(proj))
 agent.auto_approve = True
 tools, text, result = [], [], {}

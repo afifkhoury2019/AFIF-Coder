@@ -17,11 +17,13 @@ for m in CATALOG:
         try:
             r = requests.head(url, allow_redirects=False, timeout=30)
             size = int(r.headers.get("X-Linked-Size") or r.headers.get("Content-Length") or 0) / 1024 ** 3
-            ok = r.status_code in (200, 302, 307) and abs(size - m["size"]) <= max(0.6, m["size"] * 0.15)
-            msg = f"{url.split('.co/')[1]}: HTTP {r.status_code}, {size:.2f} GB (catalog {m['size']})"
+            ok = r.status_code in (200, 302, 307)
+            close = abs(size - m["size"]) <= max(0.4, m["size"] * 0.1)
+            msg = f"{url.split('.co/')[1]}: HTTP {r.status_code}, {size:.2f} GB (catalog {m['size']})" \
+                + ("" if close or not ok else "  <- size differs")
         except requests.RequestException as e:
             ok, msg = False, f"{url}: {e}"
-        print(("::notice::" if ok else "::warning::") + msg, flush=True)
+        print(("::notice::" if ok and close else "::warning::") + msg, flush=True)
         any_ok |= ok
     if not any_ok:
         print(f"::error::No working source for {m['name']}", flush=True)

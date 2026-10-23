@@ -36,7 +36,7 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-WelcomeLabel2=This will install [name/ver] on your computer.%n%nAFIF Coder is a coding assistant that runs completely on this PC with its built-in AFIF Engine. No accounts, no subscriptions, no usage limits.%n%nAfter installing, AFIF Coder will offer to download a coding model (1-18 GB, once).
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nAFIF Coder is a coding assistant with its own built-in AFIF Engine. Local models run entirely on this PC, need no account and have no usage limits. You can also connect Claude, Gemini or DeepSeek with your own API key.%n%nAfter installing, AFIF Coder will offer to download a local model (1-18 GB, once).
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"

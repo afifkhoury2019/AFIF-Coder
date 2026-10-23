@@ -1,9 +1,14 @@
 AFIF Coder
 Copyright (c) 2026 AFIF-TECH. All rights reserved.
 
-AFIF Coder runs entirely on your computer. It does not send your code, files or
-prompts anywhere. The only network access is downloading models you choose in the
-Models window, from Hugging Face.
+With a local model, AFIF Coder runs entirely on your computer and does not send
+your code, files or prompts anywhere; the only network access is downloading the
+models you choose, from Hugging Face.
+
+If you connect a cloud model (Claude, Gemini, DeepSeek or another service) with your
+own API key, your messages, attached files and the file contents the model reads
+are sent to that provider and handled under its terms, and use is billed to your
+account with that provider. API keys are stored encrypted for your Windows account.
 
 The software is provided "as is", without warranty of any kind. AFIF Coder can
 change files and run commands in the project folder you open; changes are shown

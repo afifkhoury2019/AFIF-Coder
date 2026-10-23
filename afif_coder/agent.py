@@ -1,4 +1,4 @@
-"""The agent loop: talks to the built-in AFIF Engine and runs tools (background thread)."""
+"""The agent loop: streams turns from the selected model backend and runs tools (background thread)."""
 from __future__ import annotations
 
 import json
@@ -11,9 +11,10 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import QObject, Signal
 
+from .backends import Backend, BackendError
 from .tools import Toolbox, ToolError
 
-SYSTEM_PROMPT = """You are AFIF Coder, a coding assistant made by AFIF-TECH, running entirely on the user's own computer.
+SYSTEM_PROMPT = """You are AFIF Coder, a coding assistant made by AFIF-TECH. Your tools run on the user's own computer.
 You work inside one project folder: {root}
 Operating system: {os}. Today is {today}.
 
@@ -26,6 +27,8 @@ How to work:
 - Never invent file contents you have not read. Paths are relative to the project folder.
 - You can only change files or run commands by calling a tool. Never say you edited, created,
   ran or fixed something unless you called the tool and saw its result in this conversation.
+- Files the user attaches appear in their message. Large ones are also saved in the project's
+  .afif-attachments folder; read them there with read_file.
 - Answer in the language the user writes in.
 """
 
@@ -78,8 +81,7 @@ def extract_text_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
     return calls, text.strip()
 
 
-class EngineError(Exception):
-    pass
+EngineError = BackendError    # older name
 
 
 class Agent(QObject):
@@ -89,12 +91,14 @@ class Agent(QObject):
     tool_finished = Signal(str, bool, str)      # call_id, ok, output
     approval_needed = Signal(str, str, dict)    # call_id, tool name, args
     status = Signal(str)
+    usage = Signal(int, int)                    # tokens in, tokens out for the last message (cloud)
     finished = Signal(str)                      # "" on success, else message
 
-    def __init__(self, settings: dict, engine_url):
+    def __init__(self, settings: dict, get_backend):
         super().__init__()
         self.s = settings
-        self.engine_url = engine_url            # callable -> base URL of the running engine
+        self.get_backend = get_backend          # callable -> Backend for the selected model
+        self._backend: Backend | None = None
         self.messages: list[dict] = []
         self.toolbox: Toolbox | None = None
         self._stop = threading.Event()
@@ -116,11 +120,8 @@ class Agent(QObject):
         self._stop.set()
         self._approved = False
         self._approval.set()
-        try:
-            if self._resp is not None:
-                self._resp.close()
-        except Exception:
-            pass
+        if self._backend is not None:
+            self._backend.close()
 
     def answer_approval(self, ok: bool, always: bool = False):
         if always:
@@ -129,11 +130,14 @@ class Agent(QObject):
         self._approval.set()
 
     # ---------------------------------------------------------------- loop
-    def run(self, user_text: str):
+    def run(self, user_content):
+        """user_content: plain text, or a list of OpenAI-style parts when files are attached."""
         self._stop.clear()
         err = ""
+        self._tin = self._tout = 0
         try:
-            self.messages.append({"role": "user", "content": user_text})
+            self._backend = self.get_backend()
+            self.messages.append({"role": "user", "content": user_content})
             nudged, used_tools = False, False
             for _ in range(int(self.s.get("max_steps", 40))):
                 if self._stop.is_set():
@@ -158,78 +162,38 @@ class Agent(QObject):
             else:
                 err = "Stopped after the maximum number of steps. Send a message to continue."
         except requests.ConnectionError:
-            err = "The AFIF Engine isn't running. Pick a model at the top, then try again."
-        except EngineError as e:
+            err = "Lost the connection to the model. Check the engine or your internet, then try again."
+        except BackendError as e:
             err = str(e)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
         if self._stop.is_set() and not err:
             err = "Stopped."
+        if self._tin or self._tout:
+            self.usage.emit(self._tin, self._tout)
         self.finished.emit(err)
 
     def _chat_once(self) -> dict | None:
-        body = {
-            "model": "afif-local",
-            "messages": self.messages,
-            "tools": Toolbox.schemas(),
-            "stream": True,
-            "temperature": float(self.s.get("temperature", 0.2)),
-        }
         self.turn_started.emit()
         self.status.emit("Thinking…")
-        content: list[str] = []
-        calls: dict[int, dict] = {}
-        self._resp = requests.post(f"{self.engine_url()}/v1/chat/completions", json=body,
-                                   stream=True, timeout=(5, 900))
-        try:
-            if self._resp.status_code != 200:
-                raise EngineError(_explain(self._resp))
-            for raw in self._resp.iter_lines():
-                if self._stop.is_set():
-                    return None
-                if not raw or not raw.startswith(b"data:"):
-                    continue
-                data = raw[5:].strip()
-                if data == b"[DONE]":
-                    break
-                chunk = json.loads(data)
-                if chunk.get("error"):
-                    raise EngineError(str(chunk["error"].get("message", chunk["error"])))
-                for ch in chunk.get("choices", []):
-                    d = ch.get("delta") or {}
-                    if d.get("content"):
-                        content.append(d["content"])
-                        self.text_delta.emit(d["content"])
-                    for tc in d.get("tool_calls") or []:
-                        slot = calls.setdefault(tc.get("index", len(calls)),
-                                                {"id": "", "name": "", "arguments": ""})
-                        if tc.get("id"):
-                            slot["id"] = tc["id"]
-                        f = tc.get("function") or {}
-                        if f.get("name"):
-                            slot["name"] += f["name"]
-                        if f.get("arguments"):
-                            slot["arguments"] += f["arguments"]
-        except (requests.exceptions.ChunkedEncodingError, AttributeError):
-            if self._stop.is_set():
-                return None
-            raise
-        finally:
-            if self._resp is not None:
-                self._resp.close()
-            self._resp = None
-        text = "".join(content)
-        if not calls:                       # model wrote the call as text instead
-            found, text = extract_text_calls(text)
-            for i, (name, args) in enumerate(found):
-                calls[i] = {"id": "", "name": name, "arguments": json.dumps(args)}
-        msg = {"role": "assistant", "content": text}
-        if calls:
-            n = len(self.messages)
-            msg["tool_calls"] = [
-                {"id": c["id"] or f"call_{n}_{i}", "type": "function",
-                 "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
-                for i, c in sorted(calls.items())]
+        turn = self._backend.stream(self.messages, Toolbox.schemas(), float(self.s.get("temperature", 0.2)),
+                                    self.text_delta.emit, self._stop.is_set)
+        if turn is None:
+            return None
+        self._tin += turn.tokens_in
+        self._tout += turn.tokens_out
+        msg = turn.msg
+        if not msg.get("tool_calls"):            # model wrote the call as text instead
+            found, text = extract_text_calls(msg.get("content") or "")
+            if found:
+                msg["content"] = text
+                msg["tool_calls"] = [{"id": "", "type": "function",
+                                      "function": {"name": n, "arguments": json.dumps(a)}} for n, a in found]
+                msg.pop("_anthropic", None)
+        n = len(self.messages)
+        for i, c in enumerate(msg.get("tool_calls") or []):
+            if not c.get("id"):
+                c["id"] = f"call_{n}_{i}"
         return msg
 
     def _do_tool(self, call: dict):
@@ -270,17 +234,3 @@ class Agent(QObject):
     def _reply(self, call_id: str, content: str):
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
 
-
-def _explain(resp) -> str:
-    try:
-        j = resp.json()
-        msg = j.get("error", {}).get("message") if isinstance(j.get("error"), dict) else j.get("error")
-        msg = msg or resp.text
-    except ValueError:
-        msg = resp.text
-    if "context" in msg.lower() and ("exceed" in msg.lower() or "too long" in msg.lower()):
-        return ("The conversation no longer fits in the model's memory. Start a new chat, "
-                "or raise the context length in Settings.")
-    if "tool" in msg.lower() and "support" in msg.lower():
-        return "This model can't use tools, so it can't read or edit files. Pick a coding model instead."
-    return f"The engine returned an error: {msg}"
