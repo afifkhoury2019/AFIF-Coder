@@ -18,12 +18,23 @@ class BackendError(Exception):
     pass
 
 
+# One connection pool for the whole app: no new TLS handshake on every model turn.
+HTTP = requests.Session()
+HTTP.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8))
+
+# Speed setting -> how hard models think before answering
+SPEEDS = ("fast", "balanced", "thorough")
+CLAUDE_EFFORT = {"fast": "low", "balanced": "medium", "thorough": "high"}
+OPENAI_EFFORT = {"fast": "low", "balanced": "medium", "thorough": "high"}
+
+
 @dataclass
 class Turn:
     """Result of one streamed assistant turn."""
     msg: dict
     tokens_in: int = 0
     tokens_out: int = 0
+    tokens_per_s: float = 0.0
 
 
 # ---------------------------------------------------------------- providers
@@ -75,7 +86,10 @@ def make_backend(provider_id: str, model: str, cfg: dict) -> "Backend":
     base = (cfg.get("base_url") or p.base_url).rstrip("/")
     if not base:
         raise BackendError("Set the address of your OpenAI-compatible service in Models → Cloud.")
-    return OpenAIBackend(base, key, model, vision=cfg.get("vision", p.vision), echo_reasoning=p.echo_reasoning)
+    b = OpenAIBackend(base, key, model, vision=cfg.get("vision", p.vision), echo_reasoning=p.echo_reasoning,
+                      label=p.label)
+    b.effort_ok = provider_id == "gemini"          # Gemini accepts reasoning_effort
+    return b
 
 
 def list_models(provider_id: str, cfg: dict) -> list[str]:
@@ -84,12 +98,12 @@ def list_models(provider_id: str, cfg: dict) -> list[str]:
     key = cfg.get("key", "")
     try:
         if p.kind == "anthropic":
-            r = requests.get(f"{p.base_url}/v1/models?limit=100", timeout=20,
+            r = HTTP.get(f"{p.base_url}/v1/models?limit=100", timeout=20,
                              headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
             _raise_for(r, p.label)
             return [m["id"] for m in r.json().get("data", [])]
         base = (cfg.get("base_url") or p.base_url).rstrip("/")
-        r = requests.get(f"{base}/models", timeout=20, headers={"Authorization": f"Bearer {key}"} if key else {})
+        r = HTTP.get(f"{base}/models", timeout=20, headers={"Authorization": f"Bearer {key}"} if key else {})
         _raise_for(r, p.label)
         ids = [m.get("id", "").removeprefix("models/") for m in r.json().get("data", [])]
         if provider_id == "gemini":     # keep chat models only
@@ -131,6 +145,29 @@ def _raise_for(r, label: str):
 
 
 # ---------------------------------------------------------------- helpers
+def _lines(resp):
+    """Stream lines the moment the server sends them. (requests' iter_lines waits until a whole
+    512-byte buffer fills, which makes replies arrive in delayed bursts.)"""
+    if "chunked" in resp.headers.get("Transfer-Encoding", "").lower():
+        yield from resp.iter_lines(chunk_size=None)          # one read per chunk as it arrives
+        return
+    fp = getattr(resp.raw, "_fp", None)
+    if fp is None or not hasattr(fp, "read1") or resp.headers.get("Content-Encoding"):
+        yield from resp.iter_lines(chunk_size=1)
+        return
+    buf = b""
+    while True:
+        data = fp.read1(65536)                               # whatever has arrived, without waiting for more
+        if not data:
+            break
+        buf += data
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            yield line.rstrip(b"\r")
+    if buf:
+        yield buf
+
+
 def _public(m: dict) -> dict:
     """Drop our private bookkeeping keys before sending a message to a server."""
     return {k: v for k, v in m.items() if not k.startswith("_")}
@@ -152,9 +189,15 @@ def text_only(content) -> str:
 class Backend:
     label = ""
     vision = False
+    speed = "balanced"
+    on_thinking = None          # callable(str): live reasoning text, so the user sees progress
 
     def __init__(self):
         self.resp = None
+
+    def _think(self, text: str):
+        if self.on_thinking and text:
+            self.on_thinking(text)
 
     def close(self):
         try:
@@ -213,20 +256,20 @@ class OpenAIBackend(Backend):
             body["max_tokens"] = self.max_tokens
         if self.temperature_ok and temperature is not None:
             body["temperature"] = temperature
+        body.update(self.extra_body())
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
-        self.resp = requests.post(f"{self.base}/chat/completions", json=body, headers=headers,
-                                  stream=True, timeout=(10, 900))
-        content, reasoning, calls, usage = [], [], {}, (0, 0)
+        url = f"{self.base}/chat/completions"
+        self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
+        content, reasoning, calls, usage, tps = [], [], {}, (0, 0), 0.0
         try:
+            for optional in ("stream_options", "reasoning_effort", "chat_template_kwargs"):
+                if self.resp.status_code == 400 and optional in body and optional in self.resp.text:
+                    self.resp.close()        # a server that doesn't know this option: retry without it
+                    body.pop(optional)
+                    self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
             if self.resp.status_code != 200:
-                if self.resp.status_code == 400 and "stream_options" in self.resp.text:
-                    self.resp.close()        # older servers: retry without usage reporting
-                    body.pop("stream_options")
-                    self.resp = requests.post(f"{self.base}/chat/completions", json=body, headers=headers,
-                                              stream=True, timeout=(10, 900))
-                if self.resp.status_code != 200:
-                    _raise_for(self.resp, self.label)
-            for raw in self.resp.iter_lines():
+                _raise_for(self.resp, self.label)
+            for raw in _lines(self.resp):     # each event the moment it arrives
                 if stopped():
                     return None
                 if not raw or not raw.startswith(b"data:"):
@@ -241,10 +284,14 @@ class OpenAIBackend(Backend):
                 if chunk.get("usage"):
                     u = chunk["usage"]
                     usage = (u.get("prompt_tokens", 0) or 0, u.get("completion_tokens", 0) or 0)
+                if chunk.get("timings"):                            # llama-server speed report
+                    tps = float(chunk["timings"].get("predicted_per_second") or 0)
                 for ch in chunk.get("choices") or []:
                     d = ch.get("delta") or {}
-                    if d.get("reasoning_content"):
-                        reasoning.append(d["reasoning_content"])
+                    r = d.get("reasoning_content") or d.get("reasoning")
+                    if r:
+                        reasoning.append(r)
+                        self._think(r)
                     if d.get("content"):
                         content.append(d["content"])
                         on_text(d["content"])
@@ -279,7 +326,15 @@ class OpenAIBackend(Backend):
                         "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
                 call.update(c["extra"])
                 msg["tool_calls"].append(call)
-        return Turn(msg, *usage)
+        return Turn(msg, *usage, tokens_per_s=tps)
+
+    local = False
+    effort_ok = False
+
+    def extra_body(self) -> dict:
+        if self.effort_ok:
+            return {"reasoning_effort": OPENAI_EFFORT.get(self.speed, "medium")}
+        return {}
 
 
 class LocalBackend(OpenAIBackend):
@@ -287,6 +342,22 @@ class LocalBackend(OpenAIBackend):
         super().__init__(f"{engine_url}/v1", "", "afif-local", vision=False, label="AFIF Engine")
         self.context_tokens = context_tokens
         self.max_tokens = min(4096, context_tokens // 4)      # stop runaway replies filling the memory
+        self.local = True
+
+    def extra_body(self) -> dict:
+        think = self.speed == "thorough"
+        # Thinking models (Qwen3, gpt-oss…) answer much sooner with thinking off; others ignore these.
+        return {"chat_template_kwargs": {"enable_thinking": think, "reasoning_effort": "medium" if think else "low"},
+                "cache_prompt": True}
+
+    def warm_up(self, messages, tools):
+        """Pre-read the instructions and tool list so the first real reply starts quickly."""
+        body = {"model": self.model, "messages": self._prepare(messages), "tools": tools, "max_tokens": 1,
+                "stream": False, **self.extra_body()}
+        try:
+            HTTP.post(f"{self.base}/chat/completions", json=body, timeout=(5, 600))
+        except requests.RequestException:
+            pass
 
     def stream(self, *a, **k):
         try:
@@ -374,12 +445,17 @@ class AnthropicBackend(Backend):
             last = msgs[-1]["content"][-1]
             if last.get("type") not in ("thinking", "redacted_thinking"):
                 msgs[-1]["content"][-1] = dict(last, cache_control={"type": "ephemeral"})
-        body = {"model": self.model, "max_tokens": 16000,
+        body = {"model": self.model, "max_tokens": 32000,
                 "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-                "messages": msgs, "tools": tools_a, "stream": True}
+                "messages": msgs, "tools": tools_a, "stream": True,
+                "output_config": {"effort": CLAUDE_EFFORT.get(self.speed, "medium")}}
         headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
         try:
-            self.resp = requests.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
+            self.resp = HTTP.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
+            if self.resp.status_code == 400 and ("output_config" in self.resp.text or "effort" in self.resp.text):
+                self.resp.close()                       # older model without effort support
+                body.pop("output_config")
+                self.resp = HTTP.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
         except requests.ConnectionError:
             raise BackendError("Can't reach Claude. Check your internet connection.")
         blocks: dict[int, dict] = {}
@@ -388,7 +464,7 @@ class AnthropicBackend(Backend):
         try:
             if self.resp.status_code != 200:
                 _raise_for(self.resp, "Claude")
-            for raw in self.resp.iter_lines():
+            for raw in _lines(self.resp):
                 if stopped():
                     return None
                 if not raw:
@@ -422,6 +498,7 @@ class AnthropicBackend(Backend):
                         b["_json"] += dl.get("partial_json", "")
                     elif k == "thinking_delta":
                         b["thinking"] = b.get("thinking", "") + dl.get("thinking", "")
+                        self._think(dl.get("thinking", ""))
                     elif k == "signature_delta":
                         b["signature"] = b.get("signature", "") + dl.get("signature", "")
                 elif t == "message_delta":

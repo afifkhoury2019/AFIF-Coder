@@ -142,7 +142,9 @@ class Engine(QObject):
     def _launch(self, gen, exe: Path, backend: str, model_path: str, ctx: int) -> str | None:
         self.port = _free_port()
         args = [str(exe), "-m", model_path, "--host", "127.0.0.1", "--port", str(self.port),
-                "-c", str(ctx), "--jinja", "--alias", "afif-local"]
+                "-c", str(ctx), "--jinja", "--alias", "afif-local",
+                "-np", "1",                  # one conversation: the whole cache serves it, nothing evicted
+                "--cache-reuse", "256"]      # reuse already-read text even after old output is trimmed
         if backend in ("vulkan", "custom"):
             args += ["-ngl", "999"]
         extra = os.environ.get("AFIF_ENGINE_ARGS")

@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import json
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -352,6 +353,9 @@ class MainWindow(QMainWindow):
         self.sel = ""                     # "local:<path>" or "cloud:<provider>:<model>"
         self.pending: list[Attachment] = []
         self.last_usage = (0, 0)
+        self.last_timing = (0.0, 0.0)
+        self.think = None
+        self.think_buf, self.think_t0 = "", 0.0
         self.setAcceptDrops(True)
         self.reply: ReplyBlock | None = None
         self.reply_buf = ""
@@ -496,6 +500,14 @@ class MainWindow(QMainWindow):
         self.auto = QCheckBox("Allow edits and commands without asking")
         self.status = QLabel("", objectName="muted")
         foot.addWidget(self.auto)
+        foot.addSpacing(12)
+        self.speed = QComboBox()
+        self.speed.addItems(["Fast", "Balanced", "Thorough"])
+        self.speed.setCurrentIndex({"fast": 0, "balanced": 1, "thorough": 2}.get(self.s.get("speed", "balanced"), 1))
+        self.speed.setToolTip("Fast: models think less and answer sooner (good for chat and small edits).\n"
+                              "Balanced: the default for building.\nThorough: deeper thinking, slower and costlier.")
+        foot.addWidget(QLabel("Speed", objectName="muted"))
+        foot.addWidget(self.speed)
         foot.addStretch(1)
         foot.addWidget(self.status)
         b.addLayout(foot)
@@ -534,6 +546,9 @@ class MainWindow(QMainWindow):
         a.approval_needed.connect(self._on_approval)
         a.status.connect(self.status.setText)
         a.usage.connect(lambda i, o: setattr(self, "last_usage", (i, o)))
+        a.thinking_delta.connect(self._on_think)
+        a.timing.connect(lambda first, tps: setattr(self, "last_timing", (first, tps)))
+        self.speed.currentIndexChanged.connect(self._speed_changed)
         a.finished.connect(self._on_finished)
 
     # ---------- theme ----------
@@ -588,6 +603,7 @@ class MainWindow(QMainWindow):
             n = sum(1 for m in saved["messages"] if m["role"] == "user" and not str(m.get("content", "")).startswith("[AFIF"))
             self.status.setText(f"Continuing your last chat in this project ({n} message{'s' * (n != 1)}). "
                                 "New chat starts fresh; progress notes carry over.")
+            self._warm_up()
         else:
             self._after_reset()
 
@@ -607,6 +623,7 @@ class MainWindow(QMainWindow):
         self.reply = None
 
     def _after_reset(self):
+        self._warm_up()
         bits = []
         if (Path(self.s["project"]) / "CODER.md").is_file():
             bits.append("CODER.md loaded")
@@ -781,6 +798,7 @@ class MainWindow(QMainWindow):
             self.status.setText(detail)
         elif state == "ready":
             self.status.setText(f"Model ready: {detail}")
+            self._warm_up()
         elif state == "loading":
             self.status.setText(detail)
 
@@ -889,6 +907,7 @@ class MainWindow(QMainWindow):
         self.input.clear()
         self._add(UserBlock(text, files))
         self.last_usage = (0, 0)
+        self.last_timing = (0.0, 0.0)
         self._set_busy(True)
         if any(a.kind == "image" for a in files) and not self._sees_images():
             self.status.setText("Sent without the images: this model can't see pictures.")
@@ -912,20 +931,57 @@ class MainWindow(QMainWindow):
     # ---------- agent signals ----------
     def _on_turn(self):
         self._flush_reply()
+        self._end_think()
         self.reply, self.reply_buf = None, ""
 
+    def _on_think(self, text: str):
+        if self.think is None:
+            self.think = QLabel(objectName="muted")
+            self.think.setWordWrap(True)
+            self.think_buf, self.think_t0 = "", time.time()
+            self._add(self.think)
+        self.think_buf += text
+        if not self.flush.isActive():
+            self.flush.start()
+
+    def _end_think(self):
+        if self.think is not None:
+            secs = time.time() - self.think_t0
+            self.think.setText(f"Thought for {secs:.0f} s")
+            self.think.setToolTip(self.think_buf[-4000:])
+            self.think = None
+
+    def _speed_changed(self, i: int):
+        self.s["speed"] = ("fast", "balanced", "thorough")[i]
+        save_settings(self.s)
+        self._warm_up()
+
+    def _warm_up(self):
+        """Local model: pre-read instructions and tools in the background so replies start sooner."""
+        if self.busy or not self.sel.startswith("local:") or self.engine.current != "ready" \
+                or not self.s.get("project") or self.agent.toolbox is None:
+            return
+        backend = LocalBackend(self.engine.url, int(self.s.get("num_ctx", 16384)))
+        threading.Thread(target=self.agent.warm_up, args=(backend,), daemon=True).start()
+
     def _on_delta(self, text: str):
+        self._end_think()
         if self.reply is None:
             self.reply = ReplyBlock(self.css)
             self._add(self.reply)
         self.reply_buf += text
+        self.flush.setInterval(70 if len(self.reply_buf) < 4000 else 220)   # long replies: redraw less often
         if not self.flush.isActive():
             self.flush.start()
 
     def _flush_reply(self):
         self.flush.stop()
+        if self.think is not None:
+            tail = " ".join(self.think_buf.split())[-260:]
+            self.think.setText(f"Thinking… {tail}")
         if self.reply is not None:
-            shown = extract_text_calls(self.reply_buf)[1]
+            buf = self.reply_buf
+            shown = extract_text_calls(buf)[1] if ('"name"' in buf or "<tool_call>" in buf) else buf
             if "<tool_call>" in shown:                    # still streaming a text-style call
                 shown = shown[: shown.index("<tool_call>")]
             if self.reply.raw != shown:
@@ -933,6 +989,7 @@ class MainWindow(QMainWindow):
 
     def _on_tool_start(self, call_id: str, name: str, summary: str):
         self._flush_reply()
+        self._end_think()
         self.reply, self.reply_buf = None, ""   # text after a tool goes in a new block
         blk = ToolBlock(call_id, name, summary)
         blk.decided.connect(lambda cid, ok, always: self._decided(ok, always))
@@ -968,10 +1025,13 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, err: str):
         self._flush_reply()
+        self._end_think()
         self._set_busy(False)
         tin, tout = self.last_usage
         used = f"  ·  {tin:,} tokens in, {tout:,} out" if (tin or tout) else ""
-        self.status.setText((err or "Done") + used)
+        first, tps = self.last_timing
+        speed = (f"  ·  first words after {first:.1f} s" if first else "") + (f", {tps:.0f} words/s" if tps else "")
+        self.status.setText((err or "Done") + speed + used)
         if err and err != "Stopped.":
             note = ReplyBlock(self.css)
             note.set_text(f"**Couldn't finish.** {err}")

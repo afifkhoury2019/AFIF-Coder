@@ -384,6 +384,79 @@ check((pj / ".afif" / ".gitignore").read_text().startswith("chats/"), "chats are
 again.new_chat()
 check(P.load_chat() is None and list((pj / ".afif" / "chats").glob("chat-*.json")), "new chat archives the old one")
 
+print("Speed")
+check(SEEN["anthropic"].get("output_config") == {"effort": "medium"}, "Claude gets effort from the Speed setting (balanced = medium)")
+check(SEEN["gemini"].get("reasoning_effort") == "medium", "Gemini gets reasoning_effort")
+check("reasoning_effort" not in SEEN["deepseek"], "DeepSeek isn't sent options it doesn't use")
+thought = []
+b = backends.make_backend("anthropic", "claude-sonnet-5-5", {"key": "sk-ant-test"})
+b.URL = a_url + "/v1/messages"
+ag2 = Agent({"temperature": 0.2, "max_steps": 6, "speed": "fast"}, lambda: b)
+ag2.reset(str(project()))
+ag2.auto_approve = True
+ag2.thinking_delta.connect(thought.append)
+times = []
+ag2.timing.connect(lambda f, t: times.append(f))
+th = threading.Thread(target=ag2.run, args=("fix add",)); th.start()
+while th.is_alive():
+    app.processEvents(); time.sleep(0.02)
+app.processEvents()
+check(SEEN["anthropic"]["output_config"] == {"effort": "low"}, "Speed setting Fast = low effort")
+check("".join(thought) == "Read it first.", "Claude's thinking is shown live")
+check(times and 0 < times[0] < 5, f"time to first output measured ({times})")
+
+class Slow(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream")
+        chunked = self.path.startswith("/c")
+        if chunked: self.send_header("Transfer-Encoding", "chunked")
+        else: self.send_header("Connection", "close")
+        self.end_headers()
+        def w(b):
+            if chunked: self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+            else: self.wfile.write(b)
+            self.wfile.flush()
+        w(b'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n')
+        time.sleep(1.5)
+        w(b'data: {"choices":[{"index":0,"delta":{"content":" there"}}]}\n\ndata: [DONE]\n\n')
+        if chunked: self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
+        else: self.close_connection = True
+slow = serve(Slow, "slow")
+for path, kind in (("/c/v1", "chunked"), ("/p/v1", "plain")):
+    ob = backends.OpenAIBackend(slow + path, "", "m", vision=False)
+    stamps, t0 = [], time.time()
+    turn = ob.stream([{"role": "user", "content": "hi"}], [], None, lambda t: stamps.append(time.time() - t0), lambda: False)
+    check(turn.msg["content"] == "Hello there" and stamps[0] < 0.8 and stamps[-1] > 1.2,
+          f"text appears immediately, not at the end ({kind}: first {stamps[0]:.2f}s, last {stamps[-1]:.2f}s)")
+
+print("Local engine speed")
+class LocalFake(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        SEEN.setdefault("local", []).append(body)
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(b'{"choices":[{"message":{"content":"."}}]}')
+loc = serve(LocalFake, "local")
+lb = backends.LocalBackend(loc, 8192)
+agl = Agent({"speed": "fast"}, lambda: lb)
+agl.reset(str(project()))
+agl.warm_up(lb)
+w = SEEN["local"][-1]
+check(w["max_tokens"] == 1 and w["stream"] is False and w["cache_prompt"] is True, "warm-up pre-reads the prompt (1 token)")
+check(w["chat_template_kwargs"]["enable_thinking"] is False, "local thinking off unless Thorough")
+check("Project folder" in w["messages"][0]["content"] and len(w["messages"][0]["content"]) < 3000,
+      f"local models get the short system prompt ({len(w['messages'][0]['content'])} chars)")
+names = [t["function"]["name"] for t in w["tools"]]
+check("view_image" not in names and "edit_file" in names and "update_progress" in names and
+      all("description" not in p for t in w["tools"] for p in t["function"]["parameters"]["properties"].values()),
+      f"local models get a compact tool list ({len(names)} tools)")
+lb.speed = "thorough"
+check(lb.extra_body()["chat_template_kwargs"]["enable_thinking"] is True, "Thorough lets local models think")
+
 print("Key storage")
 enc = backends.protect("sk-secret-123")
 check(enc and "sk-secret" not in enc and backends.unprotect(enc) == "sk-secret-123",

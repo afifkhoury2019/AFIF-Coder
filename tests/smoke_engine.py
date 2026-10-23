@@ -34,6 +34,12 @@ proj = Path(tempfile.mkdtemp())
 agent = Agent({"temperature": 0.0, "max_steps": 12}, lambda: LocalBackend(eng.url, 8192))
 agent.reset(str(proj))
 agent.auto_approve = True
+
+t0 = time.time()
+agent.warm_up(LocalBackend(eng.url, 8192))
+print(f"::notice title=Warm-up::instructions + tools pre-read in {time.time() - t0:.1f}s while the model loads", flush=True)
+timing = []
+agent.timing.connect(lambda first, tps: timing.append((first, tps)))
 tools, text, result = [], [], {}
 agent.tool_started.connect(lambda cid, n, s: print(f"[tool] {n} {s}", flush=True))
 agent.tool_finished.connect(lambda cid, ok, out: tools.append(ok))
@@ -59,4 +65,8 @@ if err:
     print(f"::warning title=Test model::{err}")
 fixed = "a + b" in (proj / "calc.py").read_text()
 print("bug fixed by model:", fixed)
+app.processEvents()
+if timing:
+    print(f"::notice title=Speed on the build machine (CPU, 3B model)::first words after {timing[0][0]:.1f}s, "
+          f"{timing[0][1]:.0f} tokens/s", flush=True)
 print("SMOKE TEST PASSED")

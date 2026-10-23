@@ -74,6 +74,10 @@ AFIF Coder 1.2 can follow the **AFIF-TECH App Rebuild playbook** end to end with
 - **Settings**: graphics card on/off, context length, temperature, step limit, theme.
 - Choosing a cloud model unloads the local model to free your PC's memory.
 - Commands can run for up to an hour with live output (builds, `gh run watch`); **Stop** ends them.
+- **Speed** (next to the approval box): *Fast* makes models think less and answer sooner (good for chat
+  and small edits), *Balanced* is the default, *Thorough* thinks deepest. While a model thinks, its
+  thinking scrolls by in grey; the status bar shows how long the first words took.
+- Local models get a shorter prompt and pre-read it while loading, so the first reply starts quickly.
 
 The engine uses your graphics card through Vulkan (NVIDIA, AMD and Intel) and falls back to the CPU automatically if that doesn't work.
 

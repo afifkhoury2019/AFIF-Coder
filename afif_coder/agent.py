@@ -5,6 +5,7 @@ import json
 import platform
 import re
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -39,6 +40,13 @@ How to work:
 - Files the user attaches appear in their message. Large ones are also saved in the project's
   .afif-attachments folder; read them there with read_file.
 - Answer in the language the user writes in.
+"""
+
+SYSTEM_PROMPT_LEAN = """You are AFIF Coder (AFIF-TECH), a coding assistant. Project folder: {root}. {os}. Today {today}.
+Look before changing: list_dir, find_files, search_text, read_file. Change files with edit_file or write_file.
+run_command runs commands in the project (git, gh, node, python, java, rclone are available). {connections}
+Only say you changed or ran something after calling the tool. Keep going until done, then summarise briefly.
+Keep shared notes current with update_progress. Load a matching skill with use_skill. Reply in the user's language.
 """
 
 NUDGE = ("You described a change but did not call any tool, so nothing changed on disk. "
@@ -114,6 +122,8 @@ class Agent(QObject):
     approval_needed = Signal(str, str, dict)    # call_id, tool name, args
     status = Signal(str)
     usage = Signal(int, int)                    # tokens in, tokens out for the last message (cloud)
+    thinking_delta = Signal(str)                # live reasoning text
+    timing = Signal(float, float)               # seconds to first output, tokens per second
     finished = Signal(str)                      # "" on success, else message
 
     def __init__(self, settings: dict, get_backend):
@@ -126,6 +136,7 @@ class Agent(QObject):
         self.skills: dict = {}
         self.loaded: list[str] = []
         self.project: Project | None = None
+        self._lean = False
         self.messages: list[dict] = []
         self.toolbox: Toolbox | None = None
         self._stop = threading.Event()
@@ -142,13 +153,15 @@ class Agent(QObject):
         self.loaded = []
         self.messages = [{"role": "system", "content": self.system_prompt()}]
 
-    def system_prompt(self) -> str:
+    def system_prompt(self, lean: bool | None = None) -> str:
+        lean = self._lean if lean is None else lean
         root = str(self.toolbox.root)
         conn = ["GitHub is connected (gh and git push work)." if self.s.get("github_user")
                 else "GitHub isn't connected yet; if you need it, ask the user to connect it in Connections.",
                 "Google Drive is connected (drive_* tools)." if drive_connected() else "Google Drive isn't connected."]
-        prompt = SYSTEM_PROMPT.format(root=root, os=f"{platform.system()} {platform.release()}",
-                                      today=date.today().isoformat(), connections=" ".join(conn))
+        prompt = (SYSTEM_PROMPT_LEAN if lean else SYSTEM_PROMPT).format(
+            root=root, os=f"{platform.system()} {platform.release()}", today=date.today().isoformat(),
+            connections=" ".join(conn))
         notes = Path(root) / "CODER.md"
         if notes.is_file():
             prompt += "\nProject instructions from CODER.md:\n" + notes.read_text(encoding="utf-8", errors="replace")[:30000]
@@ -160,8 +173,18 @@ class Agent(QObject):
         for n in pinned:
             prompt += f"\n\n<skill name=\"{n}\" pinned=\"true\">\n{self.skills[n].full_text()}\n</skill>"
         others = {k: v for k, v in self.skills.items() if k not in pinned}
-        prompt += skillmod.catalog_text(others)
+        prompt += skillmod.catalog_text(others, short=lean)
         return prompt
+
+    def warm_up(self, backend):
+        """Local engine: read the instructions and tool list ahead of time (runs in a thread)."""
+        if not getattr(backend, "local", False) or self.toolbox is None:
+            return
+        if not self._lean:
+            self._lean = True
+            self.messages[0]["content"] = self.system_prompt(True)
+        backend.speed = self.s.get("speed", "balanced")
+        backend.warm_up([self.messages[0], {"role": "user", "content": "Hi"}], self._schemas())
 
     def resume(self, data: dict) -> list:
         """Load a saved chat for this project; returns its messages for the UI to redraw."""
@@ -216,6 +239,14 @@ class Agent(QObject):
         self._tin = self._tout = 0
         try:
             self._backend = self.get_backend()
+            self._backend.speed = self.s.get("speed", "balanced")
+            self._backend.on_thinking = self._on_think
+            lean = bool(getattr(self._backend, "local", False))
+            if lean != self._lean:                    # small local models get a short prompt: much faster to read
+                self._lean = lean
+                self.messages[0]["content"] = self.system_prompt(lean)
+            self._t0, self._first = time.time(), 0.0
+            self._tps = 0.0
             text = user_content if isinstance(user_content, str) else " ".join(
                 p.get("text", "") for p in user_content if p.get("type") == "text")
             self._auto_skills(text)
@@ -274,6 +305,8 @@ class Agent(QObject):
             err = "Stopped."
         if self._tin or self._tout:
             self.usage.emit(self._tin, self._tout)
+        if getattr(self, "_first", 0):
+            self.timing.emit(self._first, getattr(self, "_tps", 0.0))
         self.save()
         self.finished.emit(err)
 
@@ -281,11 +314,14 @@ class Agent(QObject):
         self.turn_started.emit()
         self.status.emit("Thinking…")
         turn = self._backend.stream(self.messages, self._schemas(), float(self.s.get("temperature", 0.2)),
-                                    self.text_delta.emit, self._stop.is_set)
+                                    self._on_text, self._stop.is_set)
         if turn is None:
             return None
         self._tin += turn.tokens_in
         self._tout += turn.tokens_out
+        if turn.tokens_per_s:
+            self._tps = turn.tokens_per_s
+        self._mark_first()
         msg = turn.msg
         if not msg.get("tool_calls"):            # model wrote the call as text instead
             found, text = extract_text_calls(msg.get("content") or "")
@@ -301,8 +337,20 @@ class Agent(QObject):
                 c["id"] = f"call_{n}_{i}"
         return msg
 
+    def _mark_first(self):
+        if not self._first:
+            self._first = time.time() - self._t0
+
+    def _on_text(self, t: str):
+        self._mark_first()
+        self.text_delta.emit(t)
+
+    def _on_think(self, t: str):
+        self._mark_first()
+        self.thinking_delta.emit(t)
+
     def _schemas(self) -> list[dict]:
-        out = Toolbox.schemas(drive=drive_connected(), skills=bool(self.skills))
+        out = Toolbox.schemas(drive=drive_connected(), skills=bool(self.skills), compact=self._lean)
         for name in sorted(self.active_mcp):
             srv = self.mcp.running.get(name)
             if srv and srv.alive():

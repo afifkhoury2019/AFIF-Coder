@@ -69,7 +69,7 @@ class Toolbox:
 
     # ---------- schemas ----------
     @staticmethod
-    def schemas(drive: bool = False, skills: bool = True) -> list[dict]:
+    def schemas(drive: bool = False, skills: bool = True, compact: bool = False) -> list[dict]:
         t = [
             _fn("list_dir", "List files and folders in a directory of the project.",
                 {"path": {**S, "description": "Directory relative to project root, '.' for root"}}, ["path"]),
@@ -127,6 +127,13 @@ class Toolbox:
                     {"path": S, "drive_path": {**S, "description": "Destination path in Drive, e.g. 'AFIF/builds/app.apk'"}},
                     ["path", "drive_path"]),
             ]
+        if compact:          # local models: short descriptions read much faster
+            t = [f for f in t if f["function"]["name"] not in ("view_image", "read_skill_file")]
+            for f in t:
+                fn = f["function"]
+                fn["description"] = fn["description"].split(". ")[0].rstrip(".") + "."
+                for prop in fn["parameters"]["properties"].values():
+                    prop.pop("description", None)
         return t
 
     # ---------- dispatch ----------

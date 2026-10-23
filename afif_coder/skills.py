@@ -127,10 +127,13 @@ def discover() -> dict[str, Skill]:
     return found
 
 
-def catalog_text(skills: dict[str, Skill]) -> str:
+def catalog_text(skills: dict[str, Skill], short: bool = False) -> str:
     if not skills:
         return ""
     lines = ["\nSkills (load the full instructions with use_skill before starting a matching task):"]
     for s in skills.values():
-        lines.append(f"- {s.name}: {s.description}")
+        d = s.description
+        if short:
+            d = d.split(". ")[0][:110]
+        lines.append(f"- {s.name}: {d}")
     return "\n".join(lines)
