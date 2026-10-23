@@ -457,6 +457,50 @@ check("view_image" not in names and "edit_file" in names and "update_progress" i
 lb.speed = "thorough"
 check(lb.extra_body()["chat_template_kwargs"]["enable_thinking"] is True, "Thorough lets local models think")
 
+print("Stop never freezes the window")
+class Hang(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked"); self.end_headers()
+        ev = b'data: {"choices":[{"index":0,"prompt_progress":null,"delta":{}}],"prompt_progress":{"total":8000,"cache":0,"processed":2000,"time_ms":5}}\n\n'
+        self.wfile.write(f"{len(ev):x}\r\n".encode() + ev + b"\r\n"); self.wfile.flush()
+        time.sleep(30)                                  # engine busy reading a long prompt
+hang = serve(Hang, "hang")
+hb = backends.LocalBackend(hang, 8192)
+ah = Agent({"speed": "fast"}, lambda: hb)
+ah.reset(str(project()))
+prog, done = [], {}
+ah.progress.connect(lambda d, t: prog.append((d, t)))
+ah.finished.connect(lambda e: done.setdefault("err", e))
+th = threading.Thread(target=ah.run, args=("hi",)); th.start()
+t_end = time.time() + 3
+while time.time() < t_end:
+    app.processEvents(); time.sleep(0.05)
+t0 = time.time(); ah.stop(); stop_took = time.time() - t0
+t_end = time.time() + 5
+while th.is_alive() and time.time() < t_end:
+    app.processEvents(); time.sleep(0.05)
+app.processEvents()
+check(stop_took < 0.3, f"Stop returns instantly ({stop_took:.2f}s)")
+check(not th.is_alive() and done.get("err") == "Stopped.", f"the reply ends right away when stopped ({done})")
+check(prog and prog[0] == (2000, 8000), f"reading progress reported ({prog[:1]})")
+
+print("Local models don't re-read long skills")
+al = Agent({}, lambda: hb)
+al.reset(str(project()))
+al._lean = True
+al._auto_skills("can you clone apps")
+check(len(al.messages[-1]["content"]) < 300 and "use_skill" in al.messages[-1]["content"], "local: skill suggested in one line, not 6,000 tokens")
+al.messages.append({"role": "user", "content": '[AFIF Coder loaded the skill "afif-app-rebuild" because it matches this request. Follow it for this task.]\n' + "x" * 20000})
+al._shrink_skill_notes()
+check(len(al.messages[-1]["content"]) < 300, "an earlier full skill in a saved chat is shrunk for local models")
+ac = Agent({}, None); ac.reset(str(project())); ac._lean = False
+ac._auto_skills("can you clone apps")
+check(len(ac.messages[-1]["content"]) > 5000, "cloud models still get the full skill")
+
 print("Key storage")
 enc = backends.protect("sk-secret-123")
 check(enc and "sk-secret" not in enc and backends.unprotect(enc) == "sk-secret-123",

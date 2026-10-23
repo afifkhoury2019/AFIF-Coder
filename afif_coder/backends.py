@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import socket
 from dataclasses import dataclass, field
 
 import requests
@@ -199,10 +200,28 @@ class Backend:
         if self.on_thinking and text:
             self.on_thinking(text)
 
+    on_progress = None          # callable(done, total): prompt-reading progress (local engine)
+
     def close(self):
         try:
             if self.resp is not None:
                 self.resp.close()
+        except Exception:
+            pass
+
+    def abort(self):
+        """Stop a reply from ANY thread without blocking: shut the socket down so the reading
+        thread wakes up at once. (Closing the response would wait for the reader to finish.)"""
+        r = self.resp
+        if r is None:
+            return
+        try:
+            sock = getattr(getattr(r.raw, "_connection", None), "sock", None)
+            if sock is None:
+                fp = getattr(r.raw, "_fp", None)
+                sock = getattr(getattr(getattr(fp, "fp", None), "raw", None), "_sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
         except Exception:
             pass
 
@@ -286,6 +305,9 @@ class OpenAIBackend(Backend):
                     usage = (u.get("prompt_tokens", 0) or 0, u.get("completion_tokens", 0) or 0)
                 if chunk.get("timings"):                            # llama-server speed report
                     tps = float(chunk["timings"].get("predicted_per_second") or 0)
+                pp = chunk.get("prompt_progress")
+                if pp and self.on_progress:                         # llama-server reading progress
+                    self.on_progress(int(pp.get("processed", 0)), int(pp.get("total", 0)))
                 for ch in chunk.get("choices") or []:
                     d = ch.get("delta") or {}
                     r = d.get("reasoning_content") or d.get("reasoning")
@@ -309,9 +331,11 @@ class OpenAIBackend(Backend):
                         for k, v in tc.items():             # e.g. Gemini's thought signatures
                             if k not in ("index", "id", "type", "function"):
                                 slot["extra"][k] = v
-        except (requests.exceptions.ChunkedEncodingError, AttributeError):
+        except (requests.exceptions.RequestException, AttributeError, OSError, ValueError) as e:
             if stopped():
                 return None
+            if isinstance(e, (requests.exceptions.ChunkedEncodingError, requests.ConnectionError, OSError)):
+                raise BackendError(f"The connection to {self.label} dropped. Try again.")
             raise
         finally:
             self.close()
@@ -348,7 +372,7 @@ class LocalBackend(OpenAIBackend):
         think = self.speed == "thorough"
         # Thinking models (Qwen3, gpt-oss…) answer much sooner with thinking off; others ignore these.
         return {"chat_template_kwargs": {"enable_thinking": think, "reasoning_effort": "medium" if think else "low"},
-                "cache_prompt": True}
+                "cache_prompt": True, "return_progress": True}
 
     def warm_up(self, messages, tools):
         """Pre-read the instructions and tool list so the first real reply starts quickly."""
@@ -505,9 +529,11 @@ class AnthropicBackend(Backend):
                     tout = d.get("usage", {}).get("output_tokens", tout) or tout
                 elif t == "message_stop":
                     break
-        except (requests.exceptions.ChunkedEncodingError, AttributeError):
+        except (requests.exceptions.RequestException, AttributeError, OSError, ValueError) as e:
             if stopped():
                 return None
+            if isinstance(e, (requests.exceptions.ChunkedEncodingError, requests.ConnectionError, OSError)):
+                raise BackendError(f"The connection to {self.label} dropped. Try again.")
             raise
         finally:
             self.close()

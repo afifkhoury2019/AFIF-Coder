@@ -124,6 +124,7 @@ class Agent(QObject):
     usage = Signal(int, int)                    # tokens in, tokens out for the last message (cloud)
     thinking_delta = Signal(str)                # live reasoning text
     timing = Signal(float, float)               # seconds to first output, tokens per second
+    progress = Signal(int, int)                 # local engine: prompt tokens read, total
     finished = Signal(str)                      # "" on success, else message
 
     def __init__(self, settings: dict, get_backend):
@@ -171,7 +172,10 @@ class Agent(QObject):
             "\n\nThis project has no progress notes yet. Once you understand the task, create them with update_progress."
         pinned = [n for n in (self.project.pinned() if self.project else []) if n in self.skills]
         for n in pinned:
-            prompt += f"\n\n<skill name=\"{n}\" pinned=\"true\">\n{self.skills[n].full_text()}\n</skill>"
+            if lean:
+                prompt += f"\nPinned skill for this project: {n}. Call use_skill(\"{n}\") before starting work it covers."
+            else:
+                prompt += f"\n\n<skill name=\"{n}\" pinned=\"true\">\n{self.skills[n].full_text()}\n</skill>"
         others = {k: v for k, v in self.skills.items() if k not in pinned}
         prompt += skillmod.catalog_text(others, short=lean)
         return prompt
@@ -204,6 +208,19 @@ class Agent(QObject):
             self.project.archive_chat()
         self.reset(str(self.toolbox.root))
 
+    def _skill_pointer(self, name: str) -> str:
+        return (f"[AFIF Coder: the skill \"{name}\" matches this request. If you are going to do that work, "
+                f"call use_skill(\"{name}\") first and follow it. For a simple question, just answer.]")
+
+    def _shrink_skill_notes(self):
+        """Local models re-read the whole chat on a slow CPU: replace full skill texts loaded earlier
+        with a one-line pointer (they can load the skill again with use_skill when they need it)."""
+        for m in self.messages[1:]:
+            c = m.get("content")
+            if m["role"] == "user" and isinstance(c, str) and c.startswith("[AFIF Coder loaded the skill") and len(c) > 600:
+                name = c.split('"')[1] if '"' in c else "skill"
+                m["content"] = self._skill_pointer(name)
+
     def _auto_skills(self, text: str):
         """Load matching skills for the model, so even models that never call use_skill follow them."""
         pinned = self.project.pinned() if self.project else []
@@ -211,6 +228,12 @@ class Agent(QObject):
                 if n not in self.loaded and n not in pinned and sk.matches(text)]
         for sk in hits[:2]:
             self.loaded.append(sk.name)
+            if self._lean:
+                # A local model on a CPU would spend minutes reading a long skill before answering
+                # even "hi". Point at it instead; it loads the skill with use_skill when it starts the work.
+                self.messages.append({"role": "user", "content": self._skill_pointer(sk.name)})
+                self.skill_loaded.emit(sk.name, "suggested")
+                continue
             note = (f"[AFIF Coder loaded the skill \"{sk.name}\" because it matches this request. "
                     f"Follow it for this task.]\n<skill name=\"{sk.name}\">\n{sk.full_text()}\n</skill>")
             if sk.mcp:
@@ -223,7 +246,7 @@ class Agent(QObject):
         self._approved = False
         self._approval.set()
         if self._backend is not None:
-            self._backend.close()
+            self._backend.abort()               # never blocks the window
 
     def answer_approval(self, ok: bool, always: bool = False):
         if always:
@@ -241,10 +264,13 @@ class Agent(QObject):
             self._backend = self.get_backend()
             self._backend.speed = self.s.get("speed", "balanced")
             self._backend.on_thinking = self._on_think
+            self._backend.on_progress = lambda done, total: self.progress.emit(done, total)
             lean = bool(getattr(self._backend, "local", False))
             if lean != self._lean:                    # small local models get a short prompt: much faster to read
                 self._lean = lean
                 self.messages[0]["content"] = self.system_prompt(lean)
+            if lean:
+                self._shrink_skill_notes()
             self._t0, self._first = time.time(), 0.0
             self._tps = 0.0
             text = user_content if isinstance(user_content, str) else " ".join(
@@ -312,7 +338,7 @@ class Agent(QObject):
 
     def _chat_once(self) -> dict | None:
         self.turn_started.emit()
-        self.status.emit("Thinking…")
+        self.status.emit("Reading your message…" if self._lean else "Waiting for the model…")
         turn = self._backend.stream(self.messages, self._schemas(), float(self.s.get("temperature", 0.2)),
                                     self._on_text, self._stop.is_set)
         if turn is None:

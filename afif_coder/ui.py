@@ -393,10 +393,13 @@ class MainWindow(QMainWindow):
         h.setSpacing(8)
         brand = QLabel("AFIF Coder", objectName="brand")
         sub = QLabel("by AFIF-TECH", objectName="brandSub")
+        self.brand_sub = sub
         self.project_btn = QPushButton("Open folder…", objectName="project")
         self.project_btn.setToolTip("Change project folder")
         self.model = QComboBox()
-        self.model.setMinimumWidth(220)
+        self.model.setMinimumWidth(150)
+        self.model.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.model.setMinimumContentsLength(16)
         self.model.setToolTip("Model running on this PC")
         self.dot = QLabel("●", objectName="statusDot")
         self.conn = QLabel("", objectName="muted")
@@ -548,6 +551,7 @@ class MainWindow(QMainWindow):
         a.usage.connect(lambda i, o: setattr(self, "last_usage", (i, o)))
         a.thinking_delta.connect(self._on_think)
         a.timing.connect(lambda first, tps: setattr(self, "last_timing", (first, tps)))
+        a.progress.connect(self._on_progress)
         self.speed.currentIndexChanged.connect(self._speed_changed)
         a.finished.connect(self._on_finished)
 
@@ -670,7 +674,8 @@ class MainWindow(QMainWindow):
 
     def _on_skill(self, name: str, how: str):
         why = {"matched": "matches your request", "pinned": "pinned to this project",
-               "requested": "loaded by the model"}.get(how, how)
+               "requested": "loaded by the model",
+               "suggested": "suggested; the model loads it when it starts that work"}.get(how, how)
         lbl = QLabel(f"Skill: {name} ({why})")
         lbl.setObjectName("muted")
         self._add(lbl)
@@ -790,14 +795,17 @@ class MainWindow(QMainWindow):
         if self.sel.startswith("cloud:"):
             return                             # the engine is idle while a cloud model is chosen
         colours = {"ready": "true", "loading": "wait", "failed": "false", "off": "false"}
-        text = {"ready": "Ready", "loading": "Loading model…", "failed": "Engine error",
+        where = " (GPU)" if detail.endswith("on GPU") else (" (CPU)" if detail.endswith("on CPU") else "")
+        text = {"ready": "Ready" + where, "loading": "Loading model…", "failed": "Engine error",
                 "off": "No model loaded"}[state]
         self._set_dot(colours[state], text, detail)
         if state == "failed":
             self.engine.model = ""
             self.status.setText(detail)
         elif state == "ready":
-            self.status.setText(f"Model ready: {detail}")
+            self.status.setText(f"Model ready: {detail}" + (
+                ". It's running on the processor, so replies are slower than on a graphics card; "
+                "the Fast speed and smaller models help." if detail.endswith("on CPU") else ""))
             self._warm_up()
         elif state == "loading":
             self.status.setText(detail)
@@ -933,6 +941,18 @@ class MainWindow(QMainWindow):
         self._flush_reply()
         self._end_think()
         self.reply, self.reply_buf = None, ""
+
+    def _on_progress(self, done: int, total: int):
+        if total > 0 and self.busy:
+            pct = min(100, int(done * 100 / total))
+            self.status.setText(f"Reading your message… {pct}% ({done:,} of {total:,} tokens)")
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        w = self.width()
+        self.brand_sub.setVisible(w >= 1000)
+        self.conn_btn.setText("Connections" if w >= 900 else "Connect")
+        self.project_btn.setMaximumWidth(220 if w >= 1000 else 120)
 
     def _on_think(self, text: str):
         if self.think is None:
