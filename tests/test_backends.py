@@ -272,10 +272,11 @@ page = tb.run("web_fetch", {"url": web + "/x"})
 check("Title: AFIF" in page and "# Feeds" in page and "x()" not in page and "(https://bbc.co.uk)" in page,
       "web_fetch turns HTML into readable text")
 lines = []
-cmd = "python -c \"import time\nfor i in range(3): print('tick', i, flush=True); time.sleep(0.2)\"" \
-    if sys.platform == "win32" else "for i in 0 1 2; do echo tick $i; sleep 0.2; done"
+cmd = ('python -c "import time; [print(\'tick\', i, flush=True) or time.sleep(0.2) for i in range(3)]"'
+       if sys.platform == "win32" else "for i in 0 1 2; do echo tick $i; sleep 0.2; done")
 out = tb.run("run_command", {"command": cmd}, Ctx(on_output=lines.append))
-check("[exit code 0]" in out and len([l for l in lines if "tick" in l]) == 3, "run_command streams live output")
+check("[exit code 0]" in out and len([l for l in lines if "tick" in l]) == 3,
+      "run_command streams live output" + ("" if "[exit code 0]" in out else f" -> {out[:300]!r} {lines!r}"))
 slow = "ping -n 30 127.0.0.1" if sys.platform == "win32" else "sleep 30"
 t0 = time.time()
 out = tb.run("run_command", {"command": slow, "timeout_seconds": 5})
