@@ -154,7 +154,13 @@ class Agent(QObject):
                 if self._stop.is_set():
                     break
                 self._fit_context()
-                msg = self._chat_once()
+                try:
+                    msg = self._chat_once()
+                except BackendError as e:
+                    if "no longer fits" not in str(e) or not getattr(self._backend, "context_tokens", 0):
+                        raise
+                    self._fit_context(0.45, keep=1)       # trim harder and try once more
+                    msg = self._chat_once()
                 if msg is None:
                     break
                 self.messages.append(msg)
@@ -269,7 +275,7 @@ class Agent(QObject):
         self.tool_finished.emit(call_id, ok, out)
         self._reply(call_id, out)
 
-    def _fit_context(self):
+    def _fit_context(self, share: float = 0.7, keep: int = 2):
         """Local models have a small memory: trim old tool output when the chat gets near the limit."""
         limit = getattr(self._backend, "context_tokens", 0)
         if not limit:
@@ -279,17 +285,17 @@ class Agent(QObject):
             return sum(len(m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")))
                        + len(json.dumps(m.get("tool_calls", ""))) for m in self.messages) / 3.2
 
-        budget = limit * 0.7
+        budget = limit * share
         if size() <= budget:
             return
         tool_idx = [i for i, m in enumerate(self.messages) if m["role"] == "tool"]
-        for i in tool_idx[:-2]:                          # keep the two latest results intact
+        for i in tool_idx[:-keep]:                       # keep the latest results intact
             m = self.messages[i]
             if len(m["content"]) > 200:
                 m["content"] = m["content"][:160] + "\n[older output trimmed to save memory]"
             if size() <= budget:
                 return
-        for m in self.messages[1:-4]:                    # then long older replies and attachments
+        for m in self.messages[1:-1]:                    # then long replies and attachments, oldest first
             c = m.get("content")
             if isinstance(c, str) and len(c) > 1500:
                 m["content"] = c[:1200] + "\n[trimmed to save memory]"

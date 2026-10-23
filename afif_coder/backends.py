@@ -193,6 +193,8 @@ class OpenAIBackend(Backend):
     def stream(self, messages, tools, temperature, on_text, stopped) -> Turn | None:
         body = {"model": self.model, "messages": self._prepare(messages), "tools": tools, "stream": True,
                 "stream_options": {"include_usage": True}}
+        if getattr(self, "max_tokens", 0):
+            body["max_tokens"] = self.max_tokens
         if self.temperature_ok and temperature is not None:
             body["temperature"] = temperature
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
@@ -268,6 +270,7 @@ class LocalBackend(OpenAIBackend):
     def __init__(self, engine_url: str, context_tokens: int = 16384):
         super().__init__(f"{engine_url}/v1", "", "afif-local", vision=False, label="AFIF Engine")
         self.context_tokens = context_tokens
+        self.max_tokens = min(4096, context_tokens // 4)      # stop runaway replies filling the memory
 
     def stream(self, *a, **k):
         try:

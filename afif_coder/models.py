@@ -66,7 +66,7 @@ CATALOG = [
      "about": "DeepSeek's coding model. Mixture-of-experts: big knowledge, but fast because only part runs at once.",
      "file": "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf",
      "sources": ["bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf"]},
-    {"id": "gpt-oss-20b", "maker": "OpenAI", "name": "gpt-oss 20B", "size": 11.3, "ram": 16, "tools": "good",
+    {"id": "gpt-oss-20b", "maker": "OpenAI", "name": "gpt-oss 20B", "size": 10.8, "ram": 16, "tools": "good",
      "about": "OpenAI's open model. Excellent tool use and reasoning; mixture-of-experts, so it's quick.",
      "file": "gpt-oss-20b-Q4_K_M.gguf",
      "sources": ["unsloth/gpt-oss-20b-GGUF/gpt-oss-20b-Q4_K_M.gguf", "ggml-org/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf"]},
