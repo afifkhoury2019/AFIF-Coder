@@ -138,6 +138,7 @@ jobs:
           $out = (Get-Content cc.log -Tail 30) -join "%0A"
           if ($code -eq 2) { Write-Host "::error title=Embedded Claude Code::$out"; exit 1 }
           if ($code -ne 0) { Write-Host "::warning title=Embedded Claude Code (small model didn't finish)::$out" }
+          exit 0
 
       - name: Build app (PyInstaller, one folder)
         run: >
