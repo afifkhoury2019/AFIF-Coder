@@ -50,6 +50,7 @@ Name: "dev"; Description: "Developer tools: Git, GitHub CLI, Node.js, Python wit
 Name: "dev\browser"; Description: "Chromium for UI screenshots (Playwright)"; Types: full
 Name: "rea"; Description: "REA reverse-engineering toolkit (REA, Java JDK 21, JADX engine)"; Types: full
 Name: "drive"; Description: "Google Drive connector (rclone)"; Types: full
+Name: "claudecode"; Description: "Claude Code agent, free on this PC's model (downloaded from Anthropic's npm package during setup)"; Types: full
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
@@ -66,7 +67,7 @@ Source: "..\tools\git\*"; DestDir: "{app}\tools\git"; Components: dev; Flags: ig
 Source: "..\tools\gh\*"; DestDir: "{app}\tools\gh"; Components: dev; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\tools\python\*"; DestDir: "{app}\tools\python"; Components: dev; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\tools\ms-playwright\*"; DestDir: "{app}\tools\ms-playwright"; Components: dev\browser; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\tools\node\*"; DestDir: "{app}\tools\node"; Components: dev or rea; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\node\*"; DestDir: "{app}\tools\node"; Components: dev or rea or claudecode; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\tools\rea\*"; DestDir: "{app}\tools\rea"; Components: rea; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\tools\jdk\*"; DestDir: "{app}\tools\jdk"; Components: rea; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\tools\jadx\*"; DestDir: "{app}\tools\jadx"; Components: rea; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -77,6 +78,7 @@ Name: "{autoprograms}\AFIF Coder"; Filename: "{app}\AFIF-Coder.exe"; Comment: "L
 Name: "{autodesktop}\AFIF Coder"; Filename: "{app}\AFIF-Coder.exe"; Tasks: desktopicon
 
 [Run]
+Filename: "{app}\tools\node\npm.cmd"; Parameters: "install --prefix ""{localappdata}\AFIF-Coder\claude-code"" @anthropic-ai/claude-code --no-fund --no-audit --loglevel error"; WorkingDir: "{app}\tools\node"; Components: claudecode; Flags: runhidden waituntilterminated; StatusMsg: "Downloading Claude Code from Anthropic (npm)..."
 Filename: "{app}\AFIF-Coder.exe"; Description: "Start AFIF Coder"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

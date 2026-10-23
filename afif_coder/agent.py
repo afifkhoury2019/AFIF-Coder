@@ -216,6 +216,12 @@ class Agent(QObject):
                 pass
 
     def new_chat(self):
+        sf = self._session_file()
+        if sf and sf.is_file():
+            try:
+                sf.unlink()
+            except OSError:
+                pass
         if self.project:
             self.project.archive_chat()
         self.reset(str(self.toolbox.root))
@@ -300,59 +306,64 @@ class Agent(QObject):
             name = getattr(self._backend, "model", "") or ""
             if lean or name == "afif-local":
                 name = Path(sel[6:] if sel.startswith("local:") else sel).stem or "local model"
+            if getattr(self._backend, "harness", False):
+                name = "Claude Code + " + name
             self._msg_info = {"model": name, "backend": type(self._backend).__name__,
                               "speed": self._backend.speed, "local_prompt": lean,
                               "history_messages": len(self.messages)}
             diag.event("message_start", **self._msg_info,
                        text=(user_content if isinstance(user_content, str) else "[with attachments]")[:200])
-            text = user_content if isinstance(user_content, str) else " ".join(
-                p.get("text", "") for p in user_content if p.get("type") == "text")
-            self._auto_skills(text)
-            self.messages.append({"role": "user", "content": user_content})
-            nudged, used_tools = False, False
-            self._seen: dict[str, list] = {}         # call signature -> [times, last_ok, last_output]
-            last_batch, repeats = None, 0
-            for _ in range(int(self.s.get("max_steps", 40))):
-                if self._stop.is_set():
-                    break
-                try:
-                    msg = self._chat_once()
-                except BackendError as e:
-                    if "no longer fits" not in str(e) and "too large" not in str(e):
-                        raise
-                    self._budget_scale = 0.5              # send less history and try once more
-                    self.status.emit("The chat was too long for this model; sending a shorter part of it…")
-                    msg = self._chat_once()
-                if msg is None:
-                    break
-                self.messages.append(msg)
-                calls = msg.get("tool_calls") or []
-                if not calls:
-                    # weak models sometimes claim an action without calling the tool
-                    if not nudged and not used_tools and CLAIM.search(msg.get("content") or ""):
-                        nudged = True
-                        self.messages.append({"role": "user", "content": NUDGE})
-                        continue
-                    break
-                used_tools = True
-                batch = [_sig(c) for c in calls]
-                repeats = repeats + 1 if batch == last_batch else 0
-                last_batch = batch
-                if repeats >= 2:
-                    err = ("The model kept repeating the same steps, so it was stopped. Try rephrasing the "
-                           "request, or pick a stronger model.")
-                    for c in calls:                      # keep the history valid for the next message
-                        self._reply(c["id"], "Not run: repeated step.")
-                    break
-                skipped = calls[3:] if msg.get("_from_text") else []   # text-style batches: a few steps at a time
-                for call in calls[:len(calls) - len(skipped)]:
+            if getattr(self._backend, "harness", False):
+                err = self._run_harness(user_content)
+            else:
+                text = user_content if isinstance(user_content, str) else " ".join(
+                    p.get("text", "") for p in user_content if p.get("type") == "text")
+                self._auto_skills(text)
+                self.messages.append({"role": "user", "content": user_content})
+                nudged, used_tools = False, False
+                self._seen: dict[str, list] = {}         # call signature -> [times, last_ok, last_output]
+                last_batch, repeats = None, 0
+                for _ in range(int(self.s.get("max_steps", 40))):
                     if self._stop.is_set():
                         break
-                    self._do_tool(call)
-                for c in skipped:
-                    self._reply(c["id"], "Not run yet: do one step at a time and check each result.")
-            else:
-                err = "Stopped after the maximum number of steps. Send a message to continue."
+                    try:
+                        msg = self._chat_once()
+                    except BackendError as e:
+                        if "no longer fits" not in str(e) and "too large" not in str(e):
+                            raise
+                        self._budget_scale = 0.5              # send less history and try once more
+                        self.status.emit("The chat was too long for this model; sending a shorter part of it…")
+                        msg = self._chat_once()
+                    if msg is None:
+                        break
+                    self.messages.append(msg)
+                    calls = msg.get("tool_calls") or []
+                    if not calls:
+                        # weak models sometimes claim an action without calling the tool
+                        if not nudged and not used_tools and CLAIM.search(msg.get("content") or ""):
+                            nudged = True
+                            self.messages.append({"role": "user", "content": NUDGE})
+                            continue
+                        break
+                    used_tools = True
+                    batch = [_sig(c) for c in calls]
+                    repeats = repeats + 1 if batch == last_batch else 0
+                    last_batch = batch
+                    if repeats >= 2:
+                        err = ("The model kept repeating the same steps, so it was stopped. Try rephrasing the "
+                               "request, or pick a stronger model.")
+                        for c in calls:                      # keep the history valid for the next message
+                            self._reply(c["id"], "Not run: repeated step.")
+                        break
+                    skipped = calls[3:] if msg.get("_from_text") else []   # text-style batches: a few steps at a time
+                    for call in calls[:len(calls) - len(skipped)]:
+                        if self._stop.is_set():
+                            break
+                        self._do_tool(call)
+                    for c in skipped:
+                        self._reply(c["id"], "Not run yet: do one step at a time and check each result.")
+                else:
+                    err = "Stopped after the maximum number of steps. Send a message to continue."
         except requests.ConnectionError as e:
             err = "Lost the connection to the model. Check the engine or your internet, then try again."
             diag.error("message_error", e, **getattr(self, "_msg_info", {}),
@@ -380,6 +391,89 @@ class Agent(QObject):
                    tools=getattr(self, "_tools_run", 0), result=err or "done", **getattr(self, "_msg_info", {}))
         self.save()
         self.finished.emit(err)
+
+    # ---------------------------------------------------------------- Claude Code, embedded
+    def _harness_notes(self) -> str:
+        """What Claude Code should know from AFIF Coder: shared progress notes and where the skills are."""
+        prog = self.project.progress() if self.project else ""
+        lines = []
+        if prog.strip():
+            lines.append("Shared progress notes for this project (.afif/PROGRESS.md), written by whoever worked "
+                         "on it before. Continue from them and keep them current:\n" + prog[:6000])
+        if self.skills:
+            lines.append("AFIF skills (read the SKILL.md before starting matching work): " + "; ".join(
+                f"{n} = {sk.path / 'SKILL.md'}" for n, sk in list(self.skills.items())[:20]))
+        return "\n\n".join(lines)
+
+    def _session_file(self) -> Path | None:
+        return Path(self.toolbox.root) / ".afif" / "claude-code-session" if self.toolbox else None
+
+    def _run_harness(self, user_content) -> str:
+        from .claude_code import TOOL_NAMES, summary
+        text = user_content if isinstance(user_content, str) else " ".join(
+            p.get("text", "") for p in user_content if p.get("type") == "text")
+        self.messages.append({"role": "user", "content": text})
+        sf = self._session_file()
+        session = sf.read_text().strip() if sf and sf.is_file() else ""
+        pending: list[str] = []
+
+        def flush_text(calls=None):
+            msg = {"role": "assistant", "content": "".join(pending)}
+            if calls:
+                msg["tool_calls"] = calls
+            if msg["content"] or calls:
+                self.messages.append(msg)
+            pending.clear()
+
+        def on_event(kind, data):
+            if kind == "text":
+                self._mark_first()
+                pending.append(data)
+                self.text_delta.emit(data)
+            elif kind == "thinking":
+                self._mark_first()
+                self.thinking_delta.emit(data)
+            elif kind == "status":
+                self.status.emit(data)
+            elif kind == "tool":
+                self._mark_first()
+                cid, name, args = data
+                mapped = TOOL_NAMES.get(name, name)
+                flush_text([{"id": cid, "type": "function",
+                             "function": {"name": mapped, "arguments": json.dumps(args)}}])
+                self._tools_run = getattr(self, "_tools_run", 0) + 1
+                self.tool_started.emit(cid, mapped, summary(name, args))
+            elif kind == "tool_done":
+                cid, ok, out = data
+                out = out if len(out) < 20000 else out[:20000] + "\n... [cut]"
+                self.messages.append({"role": "tool", "tool_call_id": cid, "content": out})
+                self.tool_finished.emit(cid, ok, out)
+
+        self.turn_started.emit()
+        self.status.emit("Claude Code is working on the local model…")
+        res = self._backend.run(str(self.toolbox.root), text, self.auto_approve, session, self._harness_notes(),
+                                on_event, self._stop.is_set)
+        flush_text()
+        if res.get("session_id") and sf:
+            try:
+                sf.parent.mkdir(parents=True, exist_ok=True)
+                sf.write_text(res["session_id"])
+            except OSError:
+                pass
+        u = res.get("usage") or {}
+        self._tin += int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+        self._tout += int(u.get("output_tokens") or 0)
+        self._turns = int(res.get("num_turns") or 0)
+        if self._stop.is_set():
+            return ""
+        denied = res.get("permission_denials") or []
+        if denied:
+            names = ", ".join(sorted({d.get("tool_name", "?") for d in denied}))
+            return (f"Claude Code wasn't allowed to use: {names}. Tick \"Allow edits and commands without asking\" "
+                    "and send the message again to let it.")
+        if res.get("is_error"):
+            return "Claude Code: " + str(res.get("result") or res.get("subtype") or "it stopped with an error")
+        return ""
 
     def _chat_once(self) -> dict | None:
         t0 = time.time()

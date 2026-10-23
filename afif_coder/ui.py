@@ -285,6 +285,8 @@ class SettingsDialog(QDialog):
         self.steps = QSpinBox()
         self.steps.setRange(5, 200)
         self.steps.setValue(int(s["max_steps"]))
+        self.cc_lite = QCheckBox("Claude Code: Lite setup (short instructions, 6 tools; much faster on a laptop)")
+        self.cc_lite.setChecked(bool(s.get("cc_lite", True)))
         self.theme = QComboBox()
         self.theme.addItems(["system", "light", "dark"])
         self.theme.setCurrentText(s["theme"])
@@ -292,6 +294,7 @@ class SettingsDialog(QDialog):
         f.addRow("Context length (tokens)", self.ctx)
         f.addRow("Temperature", self.temp)
         f.addRow("Max tool steps per message", self.steps)
+        f.addRow("Claude Code", self.cc_lite)
         f.addRow("Theme", self.theme)
         hint = QLabel("A larger context lets the model hold more files, but uses more memory. "
                       f"Changes to the graphics card or context reload the model.\n\nAFIF Coder {__version__} by AFIF-TECH. "
@@ -307,7 +310,8 @@ class SettingsDialog(QDialog):
     def values(self) -> dict:
         return {"use_gpu": self.gpu.isChecked(),
                 "num_ctx": self.ctx.value(), "temperature": self.temp.value(),
-                "max_steps": self.steps.value(), "theme": self.theme.currentText()}
+                "max_steps": self.steps.value(), "theme": self.theme.currentText(),
+                "cc_lite": self.cc_lite.isChecked()}
 
 
 # ---------------------------------------------------------------- composer
@@ -717,7 +721,7 @@ class MainWindow(QMainWindow):
         if not self.s.get("project"):
             QMessageBox.information(self, "Claude Code", "Open a project folder first; Claude Code works in it.")
             return
-        if not self.sel.startswith("local:"):
+        if not self.sel.startswith(("local:", "claudecode:")):
             QMessageBox.information(self, "Claude Code", "Pick a model on this PC at the top first. Claude Code "
                                     "runs on it through the AFIF Engine (Qwen3 4B or bigger works best).")
             return
@@ -732,7 +736,7 @@ class MainWindow(QMainWindow):
             self.s["num_ctx"] = 65536
             save_settings(self.s)
             self._cc_after_load = True
-            self._load(self.sel[6:], force=True)
+            self._load(self.sel.split(":", 1)[1], force=True)
             self.status.setText("Reloading the model with a larger context for Claude Code…")
             return
         mins = cc.first_reply_minutes(SPEED.get("prompt_tps") or 0)
@@ -745,13 +749,8 @@ class MainWindow(QMainWindow):
         if cc.installed():
             self._cc_launch()
             return
-        self.status.setText("Downloading Claude Code from npm (first time only)…")
-        if not getattr(self, "_cc_wired", False):
-            self._cc_wired = True
-            self.cc_line.connect(lambda t: self.status.setText("Installing Claude Code: " + t[-120:]))
-            self.cc_done.connect(lambda ok, msg: self._cc_launch() if ok else
-                                 QMessageBox.warning(self, "Claude Code", msg))
-        threading.Thread(target=lambda: self.cc_done.emit(*cc.install(self.cc_line.emit)), daemon=True).start()
+        self._cc_launch_after = True
+        self._install_claude_code()
 
     def _cc_launch(self):
         from . import claude_code as cc
@@ -851,7 +850,7 @@ class MainWindow(QMainWindow):
         paths = installed_models(self.s["extra_models"])
         clouds = self._cloud_choices()
         want = self.s.get("model", "")
-        if want and not want.startswith(("local:", "cloud:", "auto:")):
+        if want and not want.startswith(("local:", "cloud:", "auto:", "claudecode:")):
             want = "local:" + want                       # settings from 1.0
         self.model.blockSignals(True)
         self.model.clear()
@@ -869,6 +868,10 @@ class MainWindow(QMainWindow):
             header("On this PC: free, offline")
             for p in paths:
                 self.model.addItem("   " + display_name(p), "local:" + str(p))
+        if paths:
+            header("Claude Code agent: free, on this PC, no API key")
+            for p in paths:
+                self.model.addItem("   Claude Code + " + display_name(p), "claudecode:" + str(p))
         if free:
             header("Free cloud: daily limits")
             for label, data, _ in free:
@@ -911,6 +914,14 @@ class MainWindow(QMainWindow):
             self.sel = data
             self._load(data[6:], force)
             return
+        if data.startswith("claudecode:"):
+            from . import claude_code as cc
+            self.sel = data
+            # Claude Code needs a bigger context than AFIF Coder's own chat
+            self._load(data[11:], force, ctx=max(int(self.s["num_ctx"]), cc.MIN_CONTEXT))
+            if not cc.installed():
+                self._install_claude_code()
+            return
         if self.sel == data and not force:
             return
         self.sel = data
@@ -927,11 +938,39 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Using {pretty_model(pid, model)} in the cloud. " + (
             f"{p.label} free tier: {p.note}" if p.free else f"Messages are billed to your {p.label} key."))
 
-    def _load(self, path: str, force: bool = False):
-        if not force and self.engine.model == path and self.engine.current in ("loading", "ready"):
+    def _load(self, path: str, force: bool = False, ctx: int = 0):
+        ctx = ctx or int(self.s["num_ctx"])
+        if not force and self.engine.model == path and self.engine.current in ("loading", "ready") \
+                and getattr(self, "_loaded_ctx", 0) >= ctx:
             return
         self.engine.model = path
-        self.engine.start(path, int(self.s["num_ctx"]), bool(self.s["use_gpu"]))
+        self._loaded_ctx = ctx
+        self.engine.start(path, ctx, bool(self.s["use_gpu"]))
+
+    def _install_claude_code(self):
+        """Download Claude Code from npm once (in the background), then it runs inside the chat."""
+        from . import claude_code as cc
+        if getattr(self, "_cc_installing", False):
+            return
+        self._cc_installing = True
+        if not getattr(self, "_cc_wired2", False):
+            self._cc_wired2 = True
+            self.cc_line.connect(lambda t: self.status.setText("Installing Claude Code: " + t[-120:]))
+            self.cc_done.connect(self._cc_installed)
+        self.status.setText("Downloading Claude Code from npm (first time only, about a minute)…")
+        threading.Thread(target=lambda: self.cc_done.emit(*cc.install(self.cc_line.emit)), daemon=True).start()
+
+    def _cc_installed(self, ok: bool, msg: str):
+        self._cc_installing = False
+        if getattr(self, "_cc_launch_after", False):
+            self._cc_launch_after = False
+            if ok:
+                self._cc_launch()
+        if not ok:
+            QMessageBox.warning(self, "Claude Code", msg)
+        elif self.sel.startswith("claudecode:"):
+            self.status.setText("Claude Code is installed. Type a task: it runs here, on this PC's model.")
+            self._warm_up()
 
     def _set_dot(self, on: str, text: str, tip: str):
         self.dot.setProperty("on", on)
@@ -978,6 +1017,12 @@ class MainWindow(QMainWindow):
             return make_backend(pid, model, cfg)
         if self.engine.current != "ready":
             raise BackendError("The local model isn't loaded yet.")
+        if sel.startswith("claudecode:"):
+            from . import claude_code as cc
+            if not cc.installed():
+                raise BackendError("Claude Code is still being installed. Wait for \"Claude Code is installed\" "
+                                   "below, then send again.")
+            return cc.Harness(self.engine.url, lite=bool(self.s.get("cc_lite", True)))
         return LocalBackend(self.engine.url, self.engine.ctx_effective or int(self.s.get("num_ctx", 16384)))
 
     def _sees_images(self) -> bool:
@@ -988,7 +1033,7 @@ class MainWindow(QMainWindow):
         return bool(cfg.get("vision", PROVIDERS[pid].vision))
 
     def open_models(self, tab: int = 0):
-        dlg = ModelsDialog(self.dl, self.s, lambda p: self.sel == "local:" + str(p), self, tab=tab)
+        dlg = ModelsDialog(self.dl, self.s, lambda p: self.sel.split(":", 1)[-1] == str(p), self, tab=tab)
         dlg.changed.connect(lambda: (save_settings(self.s), self.refresh_models()))
         dlg.exec()
         save_settings(self.s)
@@ -1001,8 +1046,8 @@ class MainWindow(QMainWindow):
             self.s.update(dlg.values())
             save_settings(self.s)
             self.apply_theme()
-            if old != (self.s["use_gpu"], self.s["num_ctx"]) and self.sel.startswith("local:"):
-                self._load(self.sel[6:], force=True)
+            if old != (self.s["use_gpu"], self.s["num_ctx"]) and self.sel.startswith(("local:", "claudecode:")):
+                self._select(self.sel, force=True)
 
     # ---------- attachments ----------
     def _pick_files(self):
@@ -1062,7 +1107,7 @@ class MainWindow(QMainWindow):
             self.status.setText("Choose a model first (Manage models…).")
             self.open_models()
             return
-        if self.sel.startswith("local:") and self.engine.current != "ready":
+        if self.sel.startswith(("local:", "claudecode:")) and self.engine.current != "ready":
             self.status.setText({"loading": "The model is still loading. Try again in a moment.",
                                  "failed": "The engine couldn't start. " + self.conn.toolTip()}.get(
                 self.engine.current, "The local model isn't loaded."))
@@ -1137,6 +1182,15 @@ class MainWindow(QMainWindow):
 
     def _warm_up(self):
         """Local model: pre-read instructions and tools in the background so replies start sooner."""
+        if self.sel.startswith("claudecode:"):
+            from . import claude_code as cc
+            if not self.busy and self.engine.current == "ready" and cc.installed() and self.s.get("project") \
+                    and self.agent.toolbox is not None:
+                h = cc.Harness(self.engine.url, lite=bool(self.s.get("cc_lite", True)))
+                self.status.setText("Claude Code is reading its instructions on the local model (once)…")
+                threading.Thread(target=h.warm_up, args=(self.s["project"], self.agent._harness_notes()),
+                                 daemon=True).start()
+            return
         if self.busy or not self.sel.startswith("local:") or self.engine.current != "ready" \
                 or not self.s.get("project") or self.agent.toolbox is None:
             return

@@ -763,6 +763,66 @@ check(env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:5555" and env["ANTHROPIC_MO
       and env["ANTHROPIC_AUTH_TOKEN"] and "ANTHROPIC_API_KEY" not in env, "Claude Code is pointed at the AFIF Engine, no Anthropic key")
 check(abs(claude_code.first_reply_minutes(100) - 3.33) < 0.1, "first-reply estimate shown before starting")
 
+
+print("1.3.1: Claude Code runs inside the chat (no API key)")
+os.environ["AFIF_DATA"] = tempfile.mkdtemp()
+from afif_coder import claude_code as ccm  # noqa: E402
+fake_bin = ccm.home() / "node_modules" / ".bin"
+fake_bin.mkdir(parents=True, exist_ok=True)
+fake = fake_bin / ("claude.cmd" if os.name == "nt" else "claude")
+fake_py = fake_bin / "fake_claude.py"
+fake_py.write_text(r"""
+import json, os, sys
+args = sys.argv[1:]
+prompt = sys.stdin.read()
+log = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "calls.jsonl")
+os.makedirs(os.path.dirname(log), exist_ok=True)
+open(log, "a").write(json.dumps({"args": args, "prompt": prompt, "base": os.environ.get("ANTHROPIC_BASE_URL"),
+                                 "key": os.environ.get("ANTHROPIC_API_KEY")}) + "\n")
+if "--tools" in args and os.environ.get("FAKE_NO_TOOLS_FLAG"):
+    sys.stderr.write("error: unknown option '--tools'\n"); sys.exit(1)
+def out(o): print(json.dumps(o), flush=True)
+out({"type": "system", "subtype": "init", "session_id": "sess-1", "model": "afif-local"})
+out({"type": "stream_event", "event": {"type": "message_start"}})
+out({"type": "stream_event", "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Reading calc.py. "}}})
+out({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading calc.py. "},
+     {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "calc.py"}}]}})
+out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "def add(a, b): return a - b"}]}})
+out({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_2", "name": "Edit",
+     "input": {"file_path": "calc.py", "old_string": "a - b", "new_string": "a + b"}}]}})
+open("calc.py", "w").write("def add(a, b):\n    return a + b\n")
+out({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_2", "content": [{"type": "text", "text": "ok"}]}]}})
+out({"type": "assistant", "message": {"content": [{"type": "text", "text": "Fixed: add now adds."}]}})
+out({"type": "result", "subtype": "success", "is_error": False, "result": "Fixed: add now adds.", "session_id": "sess-1",
+     "num_turns": 3, "usage": {"input_tokens": 5000, "output_tokens": 80}})
+""")
+if os.name == "nt":
+    fake.write_text(f'@"{sys.executable}" "{fake_py}" %*\n')
+else:
+    fake.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake_py}" "$@"\n')
+    fake.chmod(0o755)
+check(ccm.installed(), "Claude Code found in AFIF Coder's data folder")
+prj = project()
+h = ccm.Harness("http://127.0.0.1:7777", lite=True)
+out, ag = run_agent(h, str(prj), "fix add & don't break \"quotes\"")
+calls = [json.loads(l) for l in (ccm.home() / "config" / "calls.jsonl").read_text().splitlines()]
+check(not out.get("err") and out["tools"] == [True, True], f"Claude Code's steps appear as tool rows ({out.get('err')}, {out['tools']})")
+check("".join(out["text"]) == "Reading calc.py. Fixed: add now adds.", f"text streamed once, not twice ({''.join(out['text'])!r})")
+check("a + b" in (prj / "calc.py").read_text(), "the file was changed by Claude Code")
+check(calls[0]["base"] == "http://127.0.0.1:7777" and calls[0]["key"] is None, "talks to the AFIF Engine, no Anthropic key")
+check(calls[0]["prompt"] == "fix add & don't break \"quotes\"", "the message goes in exactly (stdin, no shell quoting)")
+a0 = calls[0]["args"]
+check("--tools" in a0 and "--system-prompt" in a0 and "bypassPermissions" in a0, "Lite setup and auto-approve passed on")
+check(any(m.get("tool_calls") and m["tool_calls"][0]["function"]["name"] == "read_file" for m in ag.messages),
+      "the chat history keeps the steps, so another model can continue")
+out2, ag = run_agent(h, str(prj), "next")
+calls = [json.loads(l) for l in (ccm.home() / "config" / "calls.jsonl").read_text().splitlines()]
+check("--resume" in calls[-1]["args"] and calls[-1]["args"][calls[-1]["args"].index("--resume") + 1] == "sess-1",
+      "the next message continues the same Claude Code session")
+os.environ["FAKE_NO_TOOLS_FLAG"] = "1"
+out3, _ = run_agent(ccm.Harness("http://127.0.0.1:7777", lite=True), str(project()), "hi")
+os.environ.pop("FAKE_NO_TOOLS_FLAG")
+check(not out3.get("err") and out3["tools"] == [True, True], f"an older Claude Code without the Lite flags falls back to the full setup ({out3.get('err')})")
 print("Key storage")
 enc = backends.protect("sk-secret-123")
 check(enc and "sk-secret" not in enc and backends.unprotect(enc) == "sk-secret-123",

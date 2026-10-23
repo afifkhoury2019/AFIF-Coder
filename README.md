@@ -46,18 +46,22 @@ quotas last much longer and replies start sooner.
 | DeepSeek | platform.deepseek.com | Billed per use, low prices |
 | Other | OpenAI, LM Studio, any OpenAI-compatible service | Depends on the service |
 
-## Claude Code, free on this PC
+## Claude Code, free on this PC (no API key)
 
-**Connections → Claude Code, free on this PC → Start Claude Code** runs Anthropic's real Claude Code agent
-in its own window on the model loaded in the AFIF Engine, with no Anthropic account and no bill (the same idea
-as `ollama launch claude`, with nothing else to install). Claude Code is downloaded from npm the first time.
-It needs a 32K+ context (AFIF Coder offers to reload the model with 64K) and sends ~20,000 tokens of
-instructions before its first answer, so on a laptop processor that first answer takes minutes; use Qwen3 4B
-or bigger, ideally on a graphics card. AFIF Coder's own chat sends about 2,000.
+Pick **Claude Code + <model>** in the model list. Anthropic's real Claude Code agent then works inside AFIF
+Coder's chat, on the model loaded in the AFIF Engine: no Anthropic account, no API key, no bill (the idea
+of `ollama launch claude`, with nothing else to install). Its steps (Read, Edit, Bash…) appear as rows like
+any other model's, the chat continues the same Claude Code session, and its work is saved in the project's
+history and progress notes, so any other model can pick it up.
 
-With a cloud model, your messages, attachments and the files the model reads are sent to that provider. The status bar shows the tokens each message used. Keys are stored encrypted for your Windows account.
-
-Manus isn't included: it's a hosted agent that works on its own servers, so it can't edit files in your project folder.
+- The installer downloads Claude Code from Anthropic's npm package during setup (Full install). If it
+  couldn't, AFIF Coder downloads it the first time you pick Claude Code.
+- **Lite setup** (Settings, on by default): short instructions and six tools (Bash, Read, Edit, Write, Glob,
+  Grep), so a laptop processor answers in reasonable time. Untick it for Claude Code's full ~20,000-token
+  setup, which needs a graphics card or patience.
+- Edits are allowed; commands need **Allow edits and commands without asking** ticked.
+- Small models (1-4B) handle simple tasks; Qwen3 4B or bigger works much better.
+- Connections → **Start Claude Code** still opens it in its own terminal window if you prefer.
 
 ## Attaching files
 
