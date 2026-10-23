@@ -22,11 +22,23 @@ def note(kind, msg):
     print(f"::{kind}::{msg}", flush=True)
 
 
-rel = requests.get("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", headers=H, timeout=60)
-if rel.status_code != 200:
-    note("error", f"GitHub API {rel.status_code}: {rel.text[:200]}")
+# The newest release isn't always built for Windows, so take the newest one that is.
+r = requests.get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=40", headers=H, timeout=60)
+if r.status_code != 200:
+    note("error", f"GitHub API {r.status_code}: {r.text[:200]}")
     sys.exit(1)
-rel = rel.json()
+
+
+def has_both(release):
+    names = [a["name"] for a in release.get("assets", [])]
+    return all(any(re.search(rf"bin-win-{k}-x64\.zip$", n) for n in names) for k in ("cpu", "vulkan"))
+
+
+rel = next((x for x in r.json() if not x.get("draft") and not x.get("prerelease") and has_both(x)), None)
+if not rel:
+    note("error", "None of the last 40 llama.cpp releases has Windows CPU + Vulkan builds: "
+         + ", ".join(x["tag_name"] for x in r.json()[:10]))
+    sys.exit(1)
 tag = rel["tag_name"]
 win = [a["name"] for a in rel["assets"] if "win" in a["name"]]
 note("notice", f"llama.cpp {tag}; Windows assets: {', '.join(win)}")
