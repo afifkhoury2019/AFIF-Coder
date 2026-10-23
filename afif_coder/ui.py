@@ -92,6 +92,7 @@ class ReplyBlock(QTextBrowser):
     def set_text(self, text: str):
         self.raw = text
         self.setMarkdown(text)
+        self.setVisible(bool(text.strip()))
 
     def _fit(self):
         self.document().setTextWidth(self.viewport().width())
