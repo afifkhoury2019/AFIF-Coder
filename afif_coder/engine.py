@@ -111,6 +111,7 @@ class Engine(QObject):
     def start(self, model_path: str, ctx: int, use_gpu: bool):
         """Start (or restart) with a model. Returns immediately; watch the state signal."""
         self.stop()
+        model_path = str(Path(model_path).resolve())   # the engine runs from its own folder
         self._gen += 1
         gen = self._gen
         threading.Thread(target=self._boot, args=(gen, model_path, ctx, use_gpu), daemon=True).start()
