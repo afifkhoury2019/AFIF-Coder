@@ -190,6 +190,9 @@ class Downloader(QObject):
         except Exception as e:
             err = str(e)
         self.cancel_flags.pop(m["id"], None)
+        from . import diag
+        diag.event("download", level="error" if err and err != "cancelled" else "info", model=m.get("name"),
+                   file=m.get("file"), result=err or "done")
         self.done.emit(m["id"], err)
 
     def _fetch(self, m, part: Path, flag):

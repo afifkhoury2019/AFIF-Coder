@@ -78,6 +78,10 @@ AFIF Coder 1.2 can follow the **AFIF-TECH App Rebuild playbook** end to end with
   and small edits), *Balanced* is the default, *Thorough* thinks deepest. While a model thinks, its
   thinking scrolls by in grey; the status bar shows how long the first words took.
 - Local models get a shorter prompt and pre-read it while loading, so the first reply starts quickly.
+- **Report** (header): a debug report of every message, model reply, tool step, model load and error, with
+  timings (time to first words, engine reading speed, cache use) and full error details. Every error in
+  the chat has a **Details** link to it. **Export report…** saves one zip to send when something is slow
+  or fails. API keys and sign-in tokens are never recorded. Logs are kept 14 days.
 
 The engine uses your graphics card through Vulkan (NVIDIA, AMD and Intel) and falls back to the CPU automatically if that doesn't work.
 

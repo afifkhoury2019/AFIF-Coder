@@ -12,6 +12,7 @@ import json
 import queue
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 
 import requests
@@ -250,6 +251,7 @@ def text_only(content) -> str:
 
 
 class Backend:
+    timing: dict = {}           # last request: status, latency, engine timings (for the debug report)
     label = ""
     vision = False
     speed = "balanced"
@@ -348,17 +350,27 @@ class OpenAIBackend(Backend):
         body.update(self.extra_body())
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
         url = f"{self.base}/chat/completions"
+        t0 = time.perf_counter()
+        self.timing = {"host": self.base.split("/")[2] if "//" in self.base else self.base, "retries": [],
+                       "request_chars": len(json.dumps(body))}
         self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
+        self.timing["headers_s"] = round(time.perf_counter() - t0, 3)
+        self.timing["status"] = self.resp.status_code
         content, reasoning, calls, usage, tps = [], [], {}, (0, 0), 0.0
         try:
             for optional in ("stream_options", "reasoning_effort", "chat_template_kwargs"):
                 if self.resp.status_code == 400 and optional in body and optional in self.resp.text:
                     self.resp.close()        # a server that doesn't know this option: retry without it
                     body.pop(optional)
+                    self.timing["retries"].append(f"without {optional}")
                     self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
+            self.timing["status"] = self.resp.status_code
             if self.resp.status_code != 200:
+                self.timing["error_body"] = self.resp.text[:800]
                 _raise_for(self.resp, self.label)
             for raw in _pump(self.resp, stopped):     # each event the moment it arrives
+                if "first_event_s" not in self.timing:
+                    self.timing["first_event_s"] = round(time.perf_counter() - t0, 3)
                 if stopped():
                     return None
                 if not raw or not raw.startswith(b"data:"):
@@ -374,10 +386,18 @@ class OpenAIBackend(Backend):
                     u = chunk["usage"]
                     usage = (u.get("prompt_tokens", 0) or 0, u.get("completion_tokens", 0) or 0)
                 if chunk.get("timings"):                            # llama-server speed report
-                    tps = float(chunk["timings"].get("predicted_per_second") or 0)
+                    tm = chunk["timings"]
+                    tps = float(tm.get("predicted_per_second") or 0)
+                    self.timing.update(engine_prompt_ms=round(tm.get("prompt_ms") or 0), engine_prompt_n=tm.get("prompt_n"),
+                                       engine_cache_n=tm.get("cache_n"), engine_gen_ms=round(tm.get("predicted_ms") or 0),
+                                       engine_gen_n=tm.get("predicted_n"),
+                                       engine_prompt_tps=round(tm.get("prompt_per_second") or 0, 1))
                 pp = chunk.get("prompt_progress")
-                if pp and self.on_progress:                         # llama-server reading progress
-                    self.on_progress(int(pp.get("processed", 0)), int(pp.get("total", 0)))
+                if pp:                                               # llama-server reading progress
+                    self.timing.update(prompt_tokens=int(pp.get("total", 0)), prompt_cached=int(pp.get("cache", 0)),
+                                       prompt_read_ms=int(pp.get("time_ms", 0)))
+                    if self.on_progress:
+                        self.on_progress(int(pp.get("processed", 0)), int(pp.get("total", 0)))
                 for ch in chunk.get("choices") or []:
                     d = ch.get("delta") or {}
                     r = d.get("reasoning_content") or d.get("reasoning")
@@ -547,9 +567,13 @@ class AnthropicBackend(Backend):
                 "messages": msgs, "tools": tools_a, "stream": True,
                 "output_config": {"effort": CLAUDE_EFFORT.get(self.speed, "medium")}}
         headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        t0 = time.perf_counter()
+        self.timing = {"host": "api.anthropic.com", "retries": [], "request_chars": len(json.dumps(body))}
         try:
             self.resp = HTTP.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
+            self.timing["headers_s"] = round(time.perf_counter() - t0, 3)
             if self.resp.status_code == 400 and ("output_config" in self.resp.text or "effort" in self.resp.text):
+                self.timing["retries"].append("without effort")
                 self.resp.close()                       # older model without effort support
                 body.pop("output_config")
                 self.resp = HTTP.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
@@ -559,9 +583,13 @@ class AnthropicBackend(Backend):
         tin = tout = 0
         event = ""
         try:
+            self.timing["status"] = self.resp.status_code
             if self.resp.status_code != 200:
+                self.timing["error_body"] = self.resp.text[:800]
                 _raise_for(self.resp, "Claude")
             for raw in _pump(self.resp, stopped):
+                if "first_event_s" not in self.timing:
+                    self.timing["first_event_s"] = round(time.perf_counter() - t0, 3)
                 if stopped():
                     return None
                 if not raw:

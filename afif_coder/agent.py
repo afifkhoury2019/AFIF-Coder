@@ -12,6 +12,7 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import QObject, Signal
 
+from . import diag
 from . import skills as skillmod
 from .project import Project
 from .backends import Backend, BackendError
@@ -103,6 +104,14 @@ def extract_text_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
 EngineError = BackendError    # older name
 
 
+def _safe_json(text) -> dict:
+    try:
+        v = json.loads(text or "{}")
+        return v if isinstance(v, dict) else {}
+    except ValueError:
+        return {}
+
+
 def _sig(call: dict) -> str:
     f = call.get("function", {})
     try:
@@ -188,7 +197,8 @@ class Agent(QObject):
             self._lean = True
             self.messages[0]["content"] = self.system_prompt(True)
         backend.speed = self.s.get("speed", "balanced")
-        backend.warm_up([self.messages[0], {"role": "user", "content": "Hi"}], self._schemas())
+        with diag.span("warm_up", prompt_chars=len(self.messages[0]["content"])):
+            backend.warm_up([self.messages[0], {"role": "user", "content": "Hi"}], self._schemas())
 
     def resume(self, data: dict) -> list:
         """Load a saved chat for this project; returns its messages for the UI to redraw."""
@@ -233,6 +243,7 @@ class Agent(QObject):
                 # even "hi". Point at it instead; it loads the skill with use_skill when it starts the work.
                 self.messages.append({"role": "user", "content": self._skill_pointer(sk.name)})
                 self.skill_loaded.emit(sk.name, "suggested")
+                diag.event("skill", name=sk.name, how="suggested (local model)")
                 continue
             note = (f"[AFIF Coder loaded the skill \"{sk.name}\" because it matches this request. "
                     f"Follow it for this task.]\n<skill name=\"{sk.name}\">\n{sk.full_text()}\n</skill>")
@@ -240,8 +251,10 @@ class Agent(QObject):
                 note += self._connect_mcp(sk.mcp)
             self.messages.append({"role": "user", "content": note})
             self.skill_loaded.emit(sk.name, "matched")
+            diag.event("skill", name=sk.name, how="matched", chars=len(note))
 
     def stop(self):
+        diag.event("stop", backend=type(self._backend).__name__ if self._backend else "")
         self._stop.set()
         self._approved = False
         self._approval.set()
@@ -273,6 +286,16 @@ class Agent(QObject):
                 self._shrink_skill_notes()
             self._t0, self._first = time.time(), 0.0
             self._tps = 0.0
+            self._turns, self._tools_run = 0, 0
+            sel = self.s.get("model", "")
+            name = getattr(self._backend, "model", "") or ""
+            if lean or name == "afif-local":
+                name = Path(sel[6:] if sel.startswith("local:") else sel).stem or "local model"
+            self._msg_info = {"model": name, "backend": type(self._backend).__name__,
+                              "speed": self._backend.speed, "local_prompt": lean,
+                              "history_messages": len(self.messages)}
+            diag.event("message_start", **self._msg_info,
+                       text=(user_content if isinstance(user_content, str) else "[with attachments]")[:200])
             text = user_content if isinstance(user_content, str) else " ".join(
                 p.get("text", "") for p in user_content if p.get("type") == "text")
             self._auto_skills(text)
@@ -321,22 +344,52 @@ class Agent(QObject):
                     self._reply(c["id"], "Not run yet: do one step at a time and check each result.")
             else:
                 err = "Stopped after the maximum number of steps. Send a message to continue."
-        except requests.ConnectionError:
+        except requests.ConnectionError as e:
             err = "Lost the connection to the model. Check the engine or your internet, then try again."
+            diag.error("message_error", e, **getattr(self, "_msg_info", {}),
+                       request=getattr(self._backend, "timing", {}))
         except BackendError as e:
             err = str(e)
+            diag.event("message_error", level="error", error=err, **getattr(self, "_msg_info", {}),
+                       request=getattr(self._backend, "timing", {}))
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
+            diag.error("message_error", e, **getattr(self, "_msg_info", {}),
+                       request=getattr(self._backend, "timing", {}))
         if self._stop.is_set() and not err:
             err = "Stopped."
         if self._tin or self._tout:
             self.usage.emit(self._tin, self._tout)
         if getattr(self, "_first", 0):
             self.timing.emit(self._first, getattr(self, "_tps", 0.0))
+        total = round(time.time() - getattr(self, "_t0", time.time()), 3)
+        first = round(getattr(self, "_first", 0.0), 3)
+        slow = total >= diag.SLOW["message"] or first >= diag.SLOW["first_words"]
+        diag.event("message", level="error" if err and err != "Stopped." else ("slow" if slow else "info"),
+                   seconds=total, first_words_s=first, tokens_per_s=round(getattr(self, "_tps", 0.0), 1),
+                   tokens_in=self._tin, tokens_out=self._tout, turns=getattr(self, "_turns", 0),
+                   tools=getattr(self, "_tools_run", 0), result=err or "done", **getattr(self, "_msg_info", {}))
         self.save()
         self.finished.emit(err)
 
     def _chat_once(self) -> dict | None:
+        t0 = time.time()
+        try:
+            msg = self._chat_once_inner()
+        except Exception as e:
+            diag.event("turn", level="error", seconds=round(time.time() - t0, 3), error=f"{type(e).__name__}: {e}",
+                       request=getattr(self._backend, "timing", {}))
+            raise
+        self._turns = getattr(self, "_turns", 0) + 1
+        secs = round(time.time() - t0, 3)
+        diag.event("turn", level="slow" if secs >= diag.SLOW["turn"] else "info", seconds=secs,
+                   stopped=msg is None, text_chars=len((msg or {}).get("content") or ""),
+                   tool_calls=[c["function"]["name"] for c in (msg or {}).get("tool_calls") or []],
+                   calls_from_text=bool((msg or {}).get("_from_text")),
+                   request=getattr(self._backend, "timing", {}))
+        return msg
+
+    def _chat_once_inner(self) -> dict | None:
         self.turn_started.emit()
         self.status.emit("Reading your message…" if self._lean else "Waiting for the model…")
         turn = self._backend.stream(self.messages, self._schemas(), float(self.s.get("temperature", 0.2)),
@@ -388,7 +441,8 @@ class Agent(QObject):
             return f"\n\n[{name} tools are already connected.]"
         self.status.emit(f"Starting {name.upper()}…")
         try:
-            srv = self.mcp.get(name, str(self.toolbox.root))
+            with diag.span("mcp_start", server=name):
+                srv = self.mcp.get(name, str(self.toolbox.root))
         except MCPError as e:
             return f"\n\n[Couldn't start the {name} tool server: {e}. Continue without it and tell the user.]"
         self.active_mcp.add(name)
@@ -409,6 +463,25 @@ class Agent(QObject):
         return not is_err, (text if len(text) < 60_000 else text[:60_000] + "\n... [output cut at 60,000 characters]"), images
 
     def _do_tool(self, call: dict):
+        t0 = time.time()
+        before = len(self.messages)
+        try:
+            self._do_tool_inner(call)
+        except Exception as e:
+            diag.error("tool", e, tool=call.get("function", {}).get("name"), seconds=round(time.time() - t0, 3))
+            raise
+        self._tools_run = getattr(self, "_tools_run", 0) + 1
+        res = self.messages[-1] if len(self.messages) > before else {}
+        out = str(res.get("content", ""))
+        ok = not out.startswith(("Error", "Not run", "The user declined"))
+        secs = round(time.time() - t0, 3)
+        fn = call.get("function", {})
+        diag.event("tool", level="error" if not ok else ("slow" if secs >= diag.SLOW["tool"] else "info"),
+                   tool=fn.get("name"), seconds=secs, ok=ok, output_chars=len(out),
+                   detail=self.toolbox.summary(fn.get("name", ""), _safe_json(fn.get("arguments")))[:200] if self.toolbox else "",
+                   error=out[:500] if not ok else "")
+
+    def _do_tool_inner(self, call: dict):
         fn = call["function"]
         name, call_id = fn["name"], call["id"]
         try:

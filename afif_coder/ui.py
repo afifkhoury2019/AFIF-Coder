@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut, QTextOption
+from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut, QTextOption
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QPlainTextEdit,
@@ -21,6 +21,7 @@ from .agent import Agent, extract_text_calls
 from .attachments import Attachment, build_message, from_image_bytes, load as load_attachment
 from .backends import PROVIDERS, BackendError, LocalBackend, make_backend, unprotect
 from .connections import ConnectionsDialog, SkillsDialog
+from .report import ReportDialog
 from .engine import Engine
 from .models import Downloader, ModelsDialog, display_name, installed_models
 from .paths import data_dir
@@ -406,6 +407,8 @@ class MainWindow(QMainWindow):
         self.new_btn = QPushButton("New chat")
         self.skills_btn = QPushButton("Skills", objectName="flat")
         self.conn_btn = QPushButton("Connections", objectName="flat")
+        self.report_btn = QPushButton("Report", objectName="flat")
+        self.report_btn.setToolTip("Debug report: timings and errors")
         self.set_btn = QPushButton("Settings", objectName="flat")
         h.addWidget(brand)
         h.addWidget(sub)
@@ -418,6 +421,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.new_btn)
         h.addWidget(self.skills_btn)
         h.addWidget(self.conn_btn)
+        h.addWidget(self.report_btn)
         h.addWidget(self.set_btn)
         v.addWidget(hdr)
 
@@ -546,6 +550,7 @@ class MainWindow(QMainWindow):
         a.skill_loaded.connect(self._on_skill)
         self.skills_btn.clicked.connect(self.open_skills)
         self.conn_btn.clicked.connect(self.open_connections)
+        self.report_btn.clicked.connect(self.open_report)
         a.approval_needed.connect(self._on_approval)
         a.status.connect(self.status.setText)
         a.usage.connect(lambda i, o: setattr(self, "last_usage", (i, o)))
@@ -689,6 +694,9 @@ class MainWindow(QMainWindow):
             self.agent.reset(self.s["project"])          # pick up pins, new skills and lessons
             self.agent.messages += msgs
             self._after_reset()
+
+    def open_report(self):
+        ReportDialog(self.s, self).exec()
 
     def open_connections(self):
         dlg = ConnectionsDialog(self.s, self)
@@ -955,6 +963,7 @@ class MainWindow(QMainWindow):
         w = self.width()
         self.brand_sub.setVisible(w >= 1000)
         self.conn_btn.setText("Connections" if w >= 900 else "Connect")
+        self.report_btn.setVisible(w >= 860)
         self.project_btn.setMaximumWidth(220 if w >= 1000 else 120)
 
     def _on_think(self, text: str):
@@ -1057,7 +1066,10 @@ class MainWindow(QMainWindow):
         self.status.setText((err or "Done") + speed + used)
         if err and err != "Stopped.":
             note = ReplyBlock(self.css)
-            note.set_text(f"**Couldn't finish.** {err}")
+            note.setOpenLinks(False)
+            note.anchorClicked.connect(lambda url: self.open_report() if url.scheme() == "afif"
+                                       else QDesktopServices.openUrl(url))
+            note.set_text(f"**Couldn't finish.** {err}  [Details](afif:report)")
             self._add(note)
         self.input.setFocus()
 

@@ -5,6 +5,7 @@ Run: python tests/test_backends.py   (exit code 0 = all passed)
 """
 import json
 import os
+from datetime import datetime
 import sys
 import tempfile
 import threading
@@ -533,6 +534,44 @@ gb = backends.make_backend("gemini", "gemini-3.8-flash", {"key": "g", "base_url"
 out, _ = run_agent(gb, str(project()), "hi")
 check("quota" in (out.get("err") or "") and "AttributeError" not in (out.get("err") or ""),
       f"a Gemini error shows its real message ({out.get('err')})")
+
+print("Debug report")
+from afif_coder import diag, report  # noqa: E402
+os.environ["AFIF_DATA"] = tempfile.mkdtemp()
+diag.event("probe", key="sk-ant-api03-SECRETSECRETSECRET", note="Bearer abcdefghijklmnopqrstuvwx", tokens_in=5,
+           body='{"access_token": "ya29.abcdefghijklmnopqrstuvwxyz"}', gkey="AIzaSyA1234567890abcdefghijklmnop")
+raw = (diag.logs_dir() / f"afif-{datetime.now():%Y-%m-%d}.jsonl").read_text()
+check("SECRET" not in raw and "abcdefghijklmnopqrstuvwx" not in raw and "ya29" not in raw and "AIzaSy" not in raw
+      and '"tokens_in": 5' in raw, "API keys and tokens never reach the log")
+diag.install_crash_hooks()
+t = threading.Thread(target=lambda: 1 / 0, name="worker-x"); t.start(); t.join()
+ev = diag.read_events()
+check(any(e["kind"] == "crash" and "ZeroDivisionError" in e.get("error", "") and "worker-x" in e.get("where", "")
+          for e in ev), "crashes in background threads are recorded with a traceback")
+b = backends.make_backend("anthropic", "claude-sonnet-5-5", {"key": "sk-ant-test"})
+b.URL = a_url + "/v1/messages"
+run_agent(b, str(project()), "fix add")
+gb = backends.make_backend("gemini", "gemini-3.8-flash", {"key": "g", "base_url": ge})
+run_agent(gb, str(project()), "hi")
+ev = diag.read_events()
+msgs = [e for e in ev if e["kind"] == "message"]
+turns = [e for e in ev if e["kind"] == "turn"]
+tools = [e for e in ev if e["kind"] == "tool"]
+check(len(msgs) == 2 and msgs[0]["result"] == "done" and msgs[0]["turns"] == 3 and msgs[0]["tools"] == 2
+      and msgs[0]["first_words_s"] > 0, f"each message logged with timing ({msgs[0] if msgs else None})")
+check(turns and "first_event_s" in turns[0]["request"] and turns[0]["request"]["status"] == 200, "each model reply logged with latency")
+check([t["tool"] for t in tools[:2]] == ["read_file", "edit_file"] and all("seconds" in t for t in tools), "each tool step logged with duration")
+gerr = [e for e in ev if e["kind"] == "message_error"]
+check(gerr and gerr[-1]["request"].get("status") == 429 and "RESOURCE_EXHAUSTED" in gerr[-1]["request"].get("error_body", ""),
+      "provider errors keep the HTTP status and the provider's message")
+page = report.render_html(ev, diag.system_info({"speed": "fast", "cloud": {"gemini": {"key": "secret-should-hide"}}}))
+check("Speed by model" in page and "claude-sonnet-5-5" in page and "rate limit" in page.lower() and "secret-should-hide" not in page,
+      "report shows speed by model and errors, hides keys")
+z = Path(tempfile.mkdtemp()) / "r.zip"
+report.export_zip(z, {"speed": "fast"})
+import zipfile as _zf  # noqa: E402
+names = _zf.ZipFile(z).namelist()
+check({"report.html", "events.jsonl"} <= set(names), f"export makes one zip ({names})")
 
 print("Key storage")
 enc = backends.protect("sk-secret-123")

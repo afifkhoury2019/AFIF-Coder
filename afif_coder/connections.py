@@ -182,6 +182,9 @@ class ConnectionsDialog(QDialog):
         self.log.appendPlainText(text.rstrip())
 
     def _done(self, job, ok, msg):
+        from . import diag
+        diag.event("connection", level="info" if ok else "error", job=job, ok=ok, message=msg[:600],
+                   log=self.log.toPlainText()[-2000:])
         self.log.setVisible(True)
         self.log.appendPlainText(msg)
         for b in (self.gh_in, self.dr_in):

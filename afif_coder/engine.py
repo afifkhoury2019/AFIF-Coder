@@ -18,6 +18,7 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import QObject, Signal
 
+from . import diag
 from .paths import app_base, data_dir
 
 EXE = "llama-server.exe" if sys.platform == "win32" else "llama-server"
@@ -125,16 +126,27 @@ class Engine(QObject):
             self._emit("failed", "The AFIF Engine files are missing. Reinstall AFIF Coder.")
             return
         last_err = ""
+        try:
+            size_gb = round(Path(model_path).stat().st_size / 1024 ** 3, 2)
+        except OSError:
+            size_gb = 0
         for backend, exe in builds:
             if gen != self._gen:
                 return
             self._emit("loading", f"Loading {name} ({'GPU' if backend == 'vulkan' else 'CPU'})…")
+            t0 = time.time()
             err = self._launch(gen, exe, backend, model_path, ctx)
+            secs = round(time.time() - t0, 2)
             if err is None:
+                diag.event("engine_load", level="slow" if secs >= diag.SLOW["engine_load"] else "info",
+                           model=name, backend=backend, seconds=secs, size_gb=size_gb, context=ctx)
                 self.model, self.backend = model_path, backend
                 self._emit("ready", f"{name} on {'GPU' if backend == 'vulkan' else 'CPU'}")
                 return
             last_err = err
+            if err != "cancelled":
+                diag.event("engine_load", level="error", model=name, backend=backend, seconds=secs, size_gb=size_gb,
+                           context=ctx, error=err, engine_log=self._log_tail(40))
             self.stop(keep_gen=True)
         if gen == self._gen:
             self._emit("failed", last_err)
@@ -172,6 +184,12 @@ class Engine(QObject):
                 pass
             time.sleep(0.5)
         return "The engine took too long to load the model."
+
+    def _log_tail(self, n: int = 40) -> str:
+        try:
+            return "\n".join(self.log_path().read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
+        except OSError:
+            return ""
 
     def _tail_reason(self) -> str:
         try:
