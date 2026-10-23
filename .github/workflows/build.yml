@@ -36,7 +36,13 @@ jobs:
           python tests/test_backends.py *> unit.log
           $code = $LASTEXITCODE
           Get-Content unit.log
-          if ($code -ne 0) { $o = (Get-Content unit.log | Select-String "FAIL|Error|Traceback" | Select-Object -First 15) -join "%0A"; Write-Host "::error title=Unit tests::$o"; exit 1 }
+          if ($code -ne 0) {
+            $f = (Get-Content unit.log | Select-String "FAIL " | Select-Object -First 10) -join "%0A"
+            $t = (Get-Content unit.log -Tail 30) -join "%0A"
+            Write-Host "::error title=Unit test failures::$f"
+            Write-Host "::error title=Unit test log (end)::$t"
+            exit 1
+          }
 
       - name: Check model download links
         run: python tests/check_model_links.py
