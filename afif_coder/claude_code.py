@@ -194,6 +194,9 @@ class Run:
         import json
         import threading
         args = self.args(auto, session, lite, partial, notes)
+        if args[0].lower().endswith((".cmd", ".bat")):
+            # cmd.exe ends the argument list at a line break; keep each argument on one line
+            args = [" | ".join(x for x in a.splitlines() if x.strip()) if "\n" in a else a for a in args]
         flags = subprocess.CREATE_NO_WINDOW if WIN else 0
         self.proc = subprocess.Popen(args, cwd=self.project, env=environment(self.engine_url),
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
