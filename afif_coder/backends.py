@@ -265,8 +265,9 @@ class OpenAIBackend(Backend):
 
 
 class LocalBackend(OpenAIBackend):
-    def __init__(self, engine_url: str):
+    def __init__(self, engine_url: str, context_tokens: int = 16384):
         super().__init__(f"{engine_url}/v1", "", "afif-local", vision=False, label="AFIF Engine")
+        self.context_tokens = context_tokens
 
     def stream(self, *a, **k):
         try:

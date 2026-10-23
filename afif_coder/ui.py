@@ -685,7 +685,7 @@ class MainWindow(QMainWindow):
             return make_backend(pid, model, cfg)
         if self.engine.current != "ready":
             raise BackendError("The local model isn't loaded yet.")
-        return LocalBackend(self.engine.url)
+        return LocalBackend(self.engine.url, int(self.s.get("num_ctx", 16384)))
 
     def _sees_images(self) -> bool:
         if not self.sel.startswith("cloud:"):

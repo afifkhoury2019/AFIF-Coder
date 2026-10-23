@@ -84,6 +84,15 @@ def extract_text_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
 EngineError = BackendError    # older name
 
 
+def _sig(call: dict) -> str:
+    f = call.get("function", {})
+    try:
+        args = json.dumps(json.loads(f.get("arguments") or "{}"), sort_keys=True)
+    except ValueError:
+        args = f.get("arguments", "")
+    return f"{f.get('name')}:{args}"
+
+
 class Agent(QObject):
     text_delta = Signal(str)
     turn_started = Signal()
@@ -139,9 +148,12 @@ class Agent(QObject):
             self._backend = self.get_backend()
             self.messages.append({"role": "user", "content": user_content})
             nudged, used_tools = False, False
+            self._seen: dict[str, list] = {}         # call signature -> [times, last_ok, last_output]
+            last_batch, repeats = None, 0
             for _ in range(int(self.s.get("max_steps", 40))):
                 if self._stop.is_set():
                     break
+                self._fit_context()
                 msg = self._chat_once()
                 if msg is None:
                     break
@@ -155,10 +167,22 @@ class Agent(QObject):
                         continue
                     break
                 used_tools = True
-                for call in calls:
+                batch = [_sig(c) for c in calls]
+                repeats = repeats + 1 if batch == last_batch else 0
+                last_batch = batch
+                if repeats >= 2:
+                    err = ("The model kept repeating the same steps, so it was stopped. Try rephrasing the "
+                           "request, or pick a stronger model.")
+                    for c in calls:                      # keep the history valid for the next message
+                        self._reply(c["id"], "Not run: repeated step.")
+                    break
+                skipped = calls[3:] if msg.get("_from_text") else []   # text-style batches: a few steps at a time
+                for call in calls[:len(calls) - len(skipped)]:
                     if self._stop.is_set():
                         break
                     self._do_tool(call)
+                for c in skipped:
+                    self._reply(c["id"], "Not run yet: do one step at a time and check each result.")
             else:
                 err = "Stopped after the maximum number of steps. Send a message to continue."
         except requests.ConnectionError:
@@ -186,6 +210,7 @@ class Agent(QObject):
         if not msg.get("tool_calls"):            # model wrote the call as text instead
             found, text = extract_text_calls(msg.get("content") or "")
             if found:
+                msg["_from_text"] = True
                 msg["content"] = text
                 msg["tool_calls"] = [{"id": "", "type": "function",
                                       "function": {"name": n, "arguments": json.dumps(a)}} for n, a in found]
@@ -210,6 +235,15 @@ class Agent(QObject):
             self._reply(call_id, out)
             return
         self.tool_started.emit(call_id, name, self.toolbox.summary(name, args))
+        sig = _sig(call)
+        seen = self._seen.setdefault(sig, [0, True, ""])
+        if seen[0] >= 1 and not seen[1] and name != "run_command":
+            out = (f"Not run: this exact call already failed with: {seen[2][:300]} "
+                   "Change something first (for example read the file again and copy the text exactly).")
+            seen[0] += 1
+            self.tool_finished.emit(call_id, False, out)
+            self._reply(call_id, out)
+            return
 
         if name in Toolbox.NEEDS_APPROVAL and not self.auto_approve:
             self.status.emit("Waiting for your approval")
@@ -228,8 +262,40 @@ class Agent(QObject):
             out, ok = f"Error: {e}", False
         except Exception as e:
             out, ok = f"Error: {type(e).__name__}: {e}", False
+        seen[0] += 1
+        seen[1], seen[2] = ok, out
+        if ok and name in ("write_file", "edit_file"):
+            self._seen = {k: v for k, v in self._seen.items() if v[1]}   # files changed: failures may now work
         self.tool_finished.emit(call_id, ok, out)
         self._reply(call_id, out)
+
+    def _fit_context(self):
+        """Local models have a small memory: trim old tool output when the chat gets near the limit."""
+        limit = getattr(self._backend, "context_tokens", 0)
+        if not limit:
+            return
+
+        def size():
+            return sum(len(m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")))
+                       + len(json.dumps(m.get("tool_calls", ""))) for m in self.messages) / 3.2
+
+        budget = limit * 0.7
+        if size() <= budget:
+            return
+        tool_idx = [i for i, m in enumerate(self.messages) if m["role"] == "tool"]
+        for i in tool_idx[:-2]:                          # keep the two latest results intact
+            m = self.messages[i]
+            if len(m["content"]) > 200:
+                m["content"] = m["content"][:160] + "\n[older output trimmed to save memory]"
+            if size() <= budget:
+                return
+        for m in self.messages[1:-4]:                    # then long older replies and attachments
+            c = m.get("content")
+            if isinstance(c, str) and len(c) > 1500:
+                m["content"] = c[:1200] + "\n[trimmed to save memory]"
+            if size() <= budget:
+                return
+        self.status.emit("This chat is near the model's memory limit. Consider starting a new chat.")
 
     def _reply(self, call_id: str, content: str):
         self.messages.append({"role": "tool", "tool_call_id": call_id, "content": content})

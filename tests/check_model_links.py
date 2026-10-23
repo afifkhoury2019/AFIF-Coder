@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from afif_coder.models import CATALOG, urls_of  # noqa: E402
 
 bad = 0
+summary = []
 for m in CATALOG:
     any_ok = False
     for url in urls_of(m):
@@ -23,9 +24,11 @@ for m in CATALOG:
                 + ("" if close or not ok else "  <- size differs")
         except requests.RequestException as e:
             ok, msg = False, f"{url}: {e}"
-        print(("::notice::" if ok and close else "::warning::") + msg, flush=True)
+        print(msg, flush=True)
+        summary.append(("OK   " if ok and close else "WARN ") + msg)
         any_ok |= ok
     if not any_ok:
         print(f"::error::No working source for {m['name']}", flush=True)
     bad += not any_ok
+print("::notice title=Model links::" + "%0A".join(summary), flush=True)
 sys.exit(1 if bad else 0)
