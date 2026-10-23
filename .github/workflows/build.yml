@@ -53,8 +53,18 @@ jobs:
           $env:AFIF_ENGINE = (Resolve-Path engine\cpu\llama-server.exe).Path
           $env:AFIF_DATA = "$env:RUNNER_TEMP\afifdata"
           $env:QT_QPA_PLATFORM = "offscreen"
-          python tests/smoke_engine.py testmodel\test.gguf
-          if ($LASTEXITCODE -ne 0) { Get-Content "$env:AFIF_DATA\engine.log" -Tail 40; exit 1 }
+          python tests/smoke_engine.py testmodel\test.gguf *> smoke.log
+          $code = $LASTEXITCODE
+          Get-Content smoke.log
+          if ($code -ne 0) {
+            $out = (Get-Content smoke.log -Tail 25) -join "%0A"
+            Write-Host "::error title=Smoke test output::$out"
+            if (Test-Path "$env:AFIF_DATA\engine.log") {
+              $log = (Get-Content "$env:AFIF_DATA\engine.log" -Tail 25) -join "%0A"
+              Write-Host "::error title=Engine log::$log"
+            }
+            exit 1
+          }
 
       - name: Build app (PyInstaller, one folder)
         run: >
