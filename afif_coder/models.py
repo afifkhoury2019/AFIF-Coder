@@ -19,31 +19,36 @@ HF = "https://huggingface.co"
 
 # Coding models that support tool calling. Sizes are the Q4_K_M download in GB.
 CATALOG = [
-    {"id": "qwen2.5-coder-1.5b", "name": "Qwen2.5 Coder 1.5B", "size": 1.1, "ram": 4,
+    {"id": "qwen2.5-coder-1.5b", "name": "Qwen2.5 Coder 1.5B", "size": 0.92, "ram": 4,
      "about": "Very light. Runs on almost any PC, but only handles simple tasks.",
      "file": "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
      "repo": "bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF"},
-    {"id": "qwen2.5-coder-3b", "name": "Qwen2.5 Coder 3B", "size": 1.9, "ram": 8,
+    {"id": "qwen2.5-coder-3b", "name": "Qwen2.5 Coder 3B", "size": 1.8, "ram": 8,
      "about": "Light. Fine for small scripts and single-file fixes.",
      "file": "Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf",
      "repo": "bartowski/Qwen2.5-Coder-3B-Instruct-GGUF"},
-    {"id": "qwen2.5-coder-7b", "name": "Qwen2.5 Coder 7B", "size": 4.7, "ram": 16,
+    {"id": "qwen2.5-coder-7b", "name": "Qwen2.5 Coder 7B", "size": 4.4, "ram": 16,
      "about": "Good balance of speed and quality for everyday coding.",
      "file": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
      "repo": "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF"},
-    {"id": "qwen2.5-coder-14b", "name": "Qwen2.5 Coder 14B", "size": 9.0, "ram": 24,
+    {"id": "qwen2.5-coder-14b", "name": "Qwen2.5 Coder 14B", "size": 8.4, "ram": 24,
      "about": "Stronger reasoning across several files. Needs a good GPU or plenty of RAM.",
      "file": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
      "repo": "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF"},
     {"id": "qwen3-coder-30b", "name": "Qwen3 Coder 30B-A3B", "size": 18.6, "ram": 32,
      "about": "The strongest option. Mixture-of-experts, so it's quicker than its size suggests.",
-     "file": "Qwen_Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
-     "repo": "bartowski/Qwen_Qwen3-Coder-30B-A3B-Instruct-GGUF"},
+     "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+     "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+     "mirrors": ["lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-GGUF"]},
 ]
 
 
+def urls_of(m: dict) -> list[str]:
+    return [f"{HF}/{r}/resolve/main/{m['file']}" for r in [m["repo"], *m.get("mirrors", [])]]
+
+
 def url_of(m: dict) -> str:
-    return f"{HF}/{m['repo']}/resolve/main/{m['file']}"
+    return urls_of(m)[0]
 
 
 def installed_models(extra: list[str]) -> list[Path]:
@@ -128,7 +133,12 @@ class Downloader(QObject):
     def _fetch(self, m, part: Path, flag):
         have = part.stat().st_size if part.exists() else 0
         headers = {"Range": f"bytes={have}-"} if have else {}
-        with requests.get(url_of(m), headers=headers, stream=True, timeout=(10, 60)) as r:
+        for url in urls_of(m):
+            r = requests.get(url, headers=headers, stream=True, timeout=(10, 60))
+            if r.status_code not in (401, 403, 404):
+                break
+            r.close()
+        with r:
             if r.status_code == 416:          # already complete
                 return
             if r.status_code not in (200, 206):

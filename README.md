@@ -12,9 +12,9 @@ It works inside one project folder and can list, read, search, create and edit f
 
 | Your PC | Model |
 |---|---|
-| 8 GB RAM | Qwen2.5 Coder 3B (1.9 GB) |
-| 16 GB RAM, or a 6–8 GB graphics card | Qwen2.5 Coder 7B (4.7 GB) |
-| 24 GB+ RAM or a 12–16 GB graphics card | Qwen2.5 Coder 14B (9 GB) |
+| 8 GB RAM | Qwen2.5 Coder 3B (1.8 GB) |
+| 16 GB RAM, or a 6–8 GB graphics card | Qwen2.5 Coder 7B (4.4 GB) |
+| 24 GB+ RAM or a 12–16 GB graphics card | Qwen2.5 Coder 14B (8.4 GB) |
 | 32 GB+ RAM | Qwen3 Coder 30B-A3B (18.6 GB) |
 
 You can also add any `.gguf` model file you already have.
