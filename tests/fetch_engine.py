@@ -29,15 +29,30 @@ if r.status_code != 200:
     sys.exit(1)
 
 
+def pick(release, kind):
+    """Find the Windows x64 zip of one backend, tolerant of naming changes."""
+    for a in release.get("assets", []):
+        n = a["name"].lower()
+        if not n.endswith(".zip") or not re.search(r"win", n) or not re.search(r"x64|amd64|x86_64", n):
+            continue
+        if any(bad in n for bad in ("cuda", "hip", "sycl", "arm64", "opencl", "cudart", "kompute")):
+            continue
+        if kind == "vulkan" and "vulkan" in n:
+            return a
+        if kind == "cpu" and ("cpu" in n or re.search(r"(avx2|noavx|x64)\.zip$", n)) and "vulkan" not in n:
+            return a
+    return None
+
+
 def has_both(release):
-    names = [a["name"] for a in release.get("assets", [])]
-    return all(any(re.search(rf"bin-win-{k}-x64\.zip$", n) for n in names) for k in ("cpu", "vulkan"))
+    return pick(release, "cpu") and pick(release, "vulkan")
 
 
 rel = next((x for x in r.json() if not x.get("draft") and not x.get("prerelease") and has_both(x)), None)
 if not rel:
-    note("error", "None of the last 40 llama.cpp releases has Windows CPU + Vulkan builds: "
-         + ", ".join(x["tag_name"] for x in r.json()[:10]))
+    first = r.json()[0]
+    note("error", f"No Windows CPU + Vulkan builds found. Files in {first['tag_name']}: "
+         + ", ".join(a["name"] for a in first.get("assets", [])) + f" (assets_url {first.get('assets_url')})")
     sys.exit(1)
 tag = rel["tag_name"]
 win = [a["name"] for a in rel["assets"] if "win" in a["name"]]
@@ -45,8 +60,7 @@ note("notice", f"llama.cpp {tag}; Windows assets: {', '.join(win)}")
 
 shutil.rmtree(ROOT, ignore_errors=True)
 for kind in ("cpu", "vulkan"):
-    pat = re.compile(rf"bin-win-{kind}-x64\.zip$")
-    asset = next((a for a in rel["assets"] if pat.search(a["name"])), None)
+    asset = pick(rel, kind)
     if not asset:
         note("error", f"No win-{kind}-x64 build in {tag}")
         sys.exit(1)
