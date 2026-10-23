@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import json
+import queue
 import socket
+import threading
 from dataclasses import dataclass, field
 
 import requests
@@ -146,6 +148,40 @@ def _raise_for(r, label: str):
 
 
 # ---------------------------------------------------------------- helpers
+_END = object()
+
+
+def _pump(resp, stopped):
+    """Read the stream on a helper thread and hand lines over through a queue, checking for Stop
+    every 0.2 s. A Stop therefore ends the reply at once on every OS, even while the socket read
+    is still blocked (Windows doesn't wake a blocked read on shutdown)."""
+    q: queue.Queue = queue.Queue()
+
+    def reader():
+        try:
+            for line in _lines(resp):
+                q.put(line)
+        except Exception as e:          # handed to the consumer
+            q.put(e)
+        q.put(_END)
+
+    threading.Thread(target=reader, daemon=True).start()
+    while True:
+        try:
+            item = q.get(timeout=0.2)
+        except queue.Empty:
+            if stopped():
+                return
+            continue
+        if item is _END:
+            return
+        if isinstance(item, Exception):
+            if stopped():
+                return
+            raise item
+        yield item
+
+
 def _lines(resp):
     """Stream lines the moment the server sends them. (requests' iter_lines waits until a whole
     512-byte buffer fills, which makes replies arrive in delayed bursts.)"""
@@ -210,20 +246,28 @@ class Backend:
             pass
 
     def abort(self):
-        """Stop a reply from ANY thread without blocking: shut the socket down so the reading
-        thread wakes up at once. (Closing the response would wait for the reader to finish.)"""
+        """Stop a reply from ANY thread without blocking, and wake the thread that is reading it.
+
+        Closing the response would wait for the reader. Shutting the socket down wakes the reader on
+        Linux; Windows only wakes it when the socket is really closed, which needs the makefile()
+        wrapper released too. The engine notices the closed connection and stops working."""
         r = self.resp
         if r is None:
             return
+        sock, sio = None, None
         try:
             sock = getattr(getattr(r.raw, "_connection", None), "sock", None)
+            fp = getattr(r.raw, "_fp", None)
+            sio = getattr(getattr(fp, "fp", None), "raw", None)          # socket.SocketIO
             if sock is None:
-                fp = getattr(r.raw, "_fp", None)
-                sock = getattr(getattr(getattr(fp, "fp", None), "raw", None), "_sock", None)
-            if sock is not None:
-                sock.shutdown(socket.SHUT_RDWR)
+                sock = getattr(sio, "_sock", None)
         except Exception:
             pass
+        for step in (lambda: sock.shutdown(socket.SHUT_RDWR), lambda: sock.close(), lambda: sio.close()):
+            try:
+                step()
+            except Exception:
+                pass
 
     def stream(self, messages, tools, temperature, on_text, stopped) -> Turn | None:
         raise NotImplementedError
@@ -288,7 +332,7 @@ class OpenAIBackend(Backend):
                     self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
             if self.resp.status_code != 200:
                 _raise_for(self.resp, self.label)
-            for raw in _lines(self.resp):     # each event the moment it arrives
+            for raw in _pump(self.resp, stopped):     # each event the moment it arrives
                 if stopped():
                     return None
                 if not raw or not raw.startswith(b"data:"):
@@ -338,8 +382,11 @@ class OpenAIBackend(Backend):
                 raise BackendError(f"The connection to {self.label} dropped. Try again.")
             raise
         finally:
-            self.close()
+            if not stopped():
+                self.close()
             self.resp = None
+        if stopped():
+            return None
         msg = {"role": "assistant", "content": "".join(content)}
         if reasoning:
             msg["_reasoning"] = "".join(reasoning)
@@ -488,7 +535,7 @@ class AnthropicBackend(Backend):
         try:
             if self.resp.status_code != 200:
                 _raise_for(self.resp, "Claude")
-            for raw in _lines(self.resp):
+            for raw in _pump(self.resp, stopped):
                 if stopped():
                     return None
                 if not raw:
@@ -536,8 +583,11 @@ class AnthropicBackend(Backend):
                 raise BackendError(f"The connection to {self.label} dropped. Try again.")
             raise
         finally:
-            self.close()
+            if not stopped():
+                self.close()
             self.resp = None
+        if stopped():
+            return None
 
         raw_blocks, text, calls = [], [], []
         for i in sorted(blocks):

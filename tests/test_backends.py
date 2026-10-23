@@ -488,6 +488,25 @@ check(stop_took < 0.3, f"Stop returns instantly ({stop_took:.2f}s)")
 check(not th.is_alive() and done.get("err") == "Stopped.", f"the reply ends right away when stopped ({done})")
 check(prog and prog[0] == (2000, 8000), f"reading progress reported ({prog[:1]})")
 
+import socket as _socket  # noqa: E402
+_orig_shutdown = _socket.socket.shutdown
+_socket.socket.shutdown = lambda self, how: None     # act like Windows: shutdown doesn't wake a blocked read
+ah2 = Agent({"speed": "fast"}, lambda: backends.LocalBackend(hang, 8192))
+ah2.reset(str(project()))
+done2 = {}
+ah2.finished.connect(lambda e: done2.setdefault("err", e))
+th = threading.Thread(target=ah2.run, args=("hi",)); th.start()
+t_end = time.time() + 2
+while time.time() < t_end:
+    app.processEvents(); time.sleep(0.05)
+t0 = time.time(); ah2.stop()
+while th.is_alive() and time.time() - t0 < 5:
+    app.processEvents(); time.sleep(0.05)
+app.processEvents()
+_socket.socket.shutdown = _orig_shutdown
+check(not th.is_alive() and done2.get("err") == "Stopped." and time.time() - t0 < 1.5,
+      f"Stop ends the reply at once even when the OS doesn't wake the socket ({time.time() - t0:.2f}s, {done2})")
+
 print("Local models don't re-read long skills")
 al = Agent({}, lambda: hb)
 al.reset(str(project()))
