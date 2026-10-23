@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import threading
 from datetime import date
 from pathlib import Path
@@ -23,8 +24,16 @@ How to work:
 - Keep going with tools until the task is done, then reply with a short summary of what changed.
 - If a tool returns an error, read it, fix your call, and try again.
 - Never invent file contents you have not read. Paths are relative to the project folder.
+- You can only change files or run commands by calling a tool. Never say you edited, created,
+  ran or fixed something unless you called the tool and saw its result in this conversation.
 - Answer in the language the user writes in.
 """
+
+NUDGE = ("You described a change but did not call any tool, so nothing changed on disk. "
+         "Call the needed tool now (for example read_file, then edit_file).")
+CLAIM = re.compile(r"\b(i|i've|i have)\s+(used|edited|updated|fixed|changed|created|wrote|written|"
+                   r"modified|replaced|ran|run)\b|\b(edit_file|write_file|run_command)\b", re.I)
+TEXT_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 
 
 class EngineError(Exception):
@@ -83,6 +92,7 @@ class Agent(QObject):
         err = ""
         try:
             self.messages.append({"role": "user", "content": user_text})
+            nudged, used_tools = False, False
             for _ in range(int(self.s.get("max_steps", 40))):
                 if self._stop.is_set():
                     break
@@ -92,7 +102,13 @@ class Agent(QObject):
                 self.messages.append(msg)
                 calls = msg.get("tool_calls") or []
                 if not calls:
+                    # weak models sometimes claim an action without calling the tool
+                    if not nudged and not used_tools and CLAIM.search(msg.get("content") or ""):
+                        nudged = True
+                        self.messages.append({"role": "user", "content": NUDGE})
+                        continue
                     break
+                used_tools = True
                 for call in calls:
                     if self._stop.is_set():
                         break
@@ -160,7 +176,19 @@ class Agent(QObject):
             if self._resp is not None:
                 self._resp.close()
             self._resp = None
-        msg = {"role": "assistant", "content": "".join(content)}
+        text = "".join(content)
+        if not calls:                       # model wrote the call as text instead
+            for i, m in enumerate(TEXT_CALL.finditer(text)):
+                try:
+                    j = json.loads(m.group(1))
+                    args = j.get("arguments", j.get("parameters", {}))
+                    calls[i] = {"id": "", "name": j.get("name", ""),
+                                "arguments": args if isinstance(args, str) else json.dumps(args)}
+                except ValueError:
+                    pass
+            if calls:
+                text = TEXT_CALL.sub("", text).strip()
+        msg = {"role": "assistant", "content": text}
         if calls:
             n = len(self.messages)
             msg["tool_calls"] = [
