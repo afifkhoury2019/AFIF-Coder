@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  APP_VERSION: "1.1.0"
+  APP_VERSION: "1.2.0"
   TEST_MODEL_URL: https://huggingface.co/bartowski/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-3B-Instruct-Q4_K_M.gguf
 
 jobs:
@@ -74,6 +74,19 @@ jobs:
             exit 1
           }
 
+      - name: Fetch bundled tools (Git, GitHub CLI, Node + REA, JDK + JADX, rclone, Python + Playwright)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tests/fetch_tools.py
+
+      - name: Test bundled tools (skills' code, Playwright screenshots, REA MCP)
+        run: |
+          $env:AFIF_TOOLS = (Resolve-Path tools).Path
+          python tests/test_windows_tools.py *> tools.log
+          $code = $LASTEXITCODE
+          Get-Content tools.log
+          if ($code -ne 0) { $o = (Get-Content tools.log | Select-String "FAIL|Error|Traceback" | Select-Object -First 15) -join "%0A"; Write-Host "::error title=Bundled tools::$o"; exit 1 }
+
       - name: Build app (PyInstaller, one folder)
         run: >
           pyinstaller --noconfirm --clean --onedir --windowed --name "AFIF-Coder"
@@ -104,13 +117,17 @@ jobs:
           $setup = "dist\AFIF-Coder-Setup-$env:APP_VERSION.exe"
           $dir = "$env:RUNNER_TEMP\AFIFInstall"
           Start-Process $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/CURRENTUSER","/DIR=$dir" -Wait
-          foreach ($f in "AFIF-Coder.exe", "engine\cpu\llama-server.exe", "engine\vulkan\llama-server.exe") {
+          foreach ($f in "AFIF-Coder.exe", "engine\cpu\llama-server.exe", "engine\vulkan\llama-server.exe",
+                       "skills\afif-app-rebuild\SKILL.md", "skills\reverse-engineer-anything\SKILL.md",
+                       "tools\git\cmd\git.exe", "tools\gh\bin\gh.exe", "tools\node\node.exe", "tools\jdk\bin\java.exe",
+                       "tools\jadx\jadx-headless-mcp-0.7.1-all.jar", "tools\rclone\rclone.exe", "tools\python\python.exe",
+                       "tools\rea\node_modules\rea-agents\scripts\rea.mjs") {
             if (-not (Test-Path "$dir\$f")) { throw "Installed copy is missing $f" }
           }
           Start-Process "$dir\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES" -Wait
           Start-Sleep 3
           if (Test-Path "$dir\AFIF-Coder.exe") { throw "Uninstall left files behind" }
-          "{0:N0} MB" -f ((Get-Item $setup).Length / 1MB)
+          Write-Host ("::notice title=Installer::{0:N0} MB" -f ((Get-Item $setup).Length / 1MB))
 
       - uses: actions/upload-artifact@v4
         with:
@@ -127,4 +144,7 @@ jobs:
           make_latest: true
           files: dist/AFIF-Coder-Setup-*.exe
           body: |
-            Windows 10/11 (64-bit) installer. Download **AFIF-Coder-Setup-${{ env.APP_VERSION }}.exe**, run it, then pick a model in the Models window on first start.
+            Windows 10/11 (64-bit) installer. Download **AFIF-Coder-Setup-${{ env.APP_VERSION }}.exe** and run it.
+            Includes the AFIF Engine, skills (App Rebuild playbook, REA, Word/Excel/PowerPoint/PDF, UI checks) and
+            helper tools: Git, GitHub CLI, Node.js + REA, Java JDK + JADX, rclone, Python + Playwright.
+            After installing: pick a model, then open Connections to sign in to GitHub and Google Drive.

@@ -90,8 +90,8 @@ def build_message(text: str, files: list[Attachment], project: str) -> str | lis
 
 # ---------------------------------------------------------------- readers
 def _save_copy(a: Attachment, project: str) -> str:
-    d = Path(project) / ".afif-attachments"
-    d.mkdir(exist_ok=True)
+    d = Path(project) / ".afif" / "attachments"
+    d.mkdir(parents=True, exist_ok=True)
     dest = d / a.name
     if a.path.is_file():
         if a.path.suffix.lower() in (".pdf", ".docx", ".xlsx", ".xlsm"):

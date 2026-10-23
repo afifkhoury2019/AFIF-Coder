@@ -171,7 +171,9 @@ check(first_asst["content"][0].get("type") == "thinking" and first_asst["content
       "thinking block with signature sent back")
 results = [c for m in last["messages"] for c in m["content"] if isinstance(c, dict) and c.get("type") == "tool_result"]
 check([r["tool_use_id"] for r in results] == ["toolu_01", "toolu_02"], "tool results match tool ids")
-check(last["tools"][0].get("input_schema") and "system" in last and "AFIF Coder" in last["system"], "tools + system prompt converted")
+check(last["tools"][0].get("input_schema") and "AFIF Coder" in last["system"][0]["text"], "tools + system prompt converted")
+check(last["system"][0].get("cache_control") and last["tools"][-1].get("cache_control")
+      and last["messages"][-1]["content"][-1].get("cache_control"), "prompt caching markers on system, tools, last turn")
 
 print("Gemini (OpenAI-compatible)")
 g_url = serve(OpenAI, "gemini")
@@ -195,7 +197,7 @@ sent = SEEN["gemini"]["messages"]
 asst = next(m for m in sent if m["role"] == "assistant")
 check(asst["tool_calls"][0].get("extra_content", {}).get("google", {}).get("thought_signature") == "GSIG",
       "thought signature echoed back")
-user = next(m for m in sent if m["role"] == "user")
+user = [m for m in sent if m["role"] == "user"][-1]
 check(isinstance(user["content"], list) and user["content"][1]["type"] == "image_url"
       and "_name" not in user["content"][1], "image sent as image_url part, private keys stripped")
 check(out["usage"] == (600, 40), "usage reported")
@@ -207,7 +209,7 @@ out, agent = run_agent(b, str(project()), content)
 sent = SEEN["deepseek"]["messages"]
 asst = next(m for m in sent if m["role"] == "assistant")
 check(asst.get("reasoning_content") == "Need to read.", "reasoning_content echoed back")
-user = next(m for m in sent if m["role"] == "user")
+user = [m for m in sent if m["role"] == "user"][-1]
 check(isinstance(user["content"], str) and "can't see images" in user["content"], "image turned into a note for a text-only model")
 
 print("Switching provider mid-conversation")
@@ -238,9 +240,148 @@ pj = project()
 msg = build_message("review these", files, str(pj))
 txt = msg[0]["text"]
 check("Substation 132/33 kV" in txt and "XLPE 500,650" in txt and "# Title" in txt, "docx/xlsx/md text included")
-check((pj / ".afif-attachments" / "big.txt").is_file() and "full copy saved as .afif-attachments/big.txt" in txt,
+check((pj / ".afif" / "attachments" / "big.txt").is_file() and "full copy saved as .afif/attachments/big.txt" in txt,
       "large file copied into project")
 check(msg[1]["image_url"]["url"].startswith("data:image/"), "image becomes a data URL")
+
+print("Screenshots reach vision models")
+shot = Path(tempfile.mkdtemp())
+img.save(str(shot / "ui.png"))
+msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "check the UI"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "v1", "type": "function",
+         "function": {"name": "view_image", "arguments": '{"path": "ui.png"}'}}]},
+        {"role": "tool", "tool_call_id": "v1", "content": "Image ui.png attached below.",
+         "_images": [msg[1]["image_url"]["url"]]}]
+_, conv = backends.AnthropicBackend("k", "m").convert(msgs)
+tr = conv[-1]["content"][0]
+check(tr["type"] == "tool_result" and tr["content"][1]["type"] == "image", "Claude: image inside tool_result")
+prep = backends.OpenAIBackend("u", "k", "m", vision=True)._prepare(msgs)
+check(prep[-1]["role"] == "user" and prep[-1]["content"][1]["type"] == "image_url" and prep[-2]["role"] == "tool",
+      "OpenAI-style: image follows tool results as a user turn")
+prep = backends.OpenAIBackend("u", "k", "m", vision=False)._prepare(msgs)
+check(prep[-1]["role"] == "tool" and "can't see images" in prep[-1]["content"], "text-only model gets a note")
+
+print("Tools: web, commands, skills, images")
+from afif_coder.tools import Ctx, Toolbox, ToolError, ToolResult  # noqa: E402
+web = serve(type("W", (BaseHTTPRequestHandler,), {"log_message": lambda *a: None, "do_GET": lambda h: (
+    h.send_response(200), h.send_header("Content-Type", "text/html"), h.end_headers(),
+    h.wfile.write("<html><head><title>AFIF</title><script>x()</script></head><body><h1>Feeds</h1>"
+                  "<p>BBC <a href='https://bbc.co.uk'>link</a></p><ul><li>one</li></ul></body></html>".encode()))}), "web")
+tb = Toolbox(str(shot), {}, {})
+page = tb.run("web_fetch", {"url": web + "/x"})
+check("Title: AFIF" in page and "# Feeds" in page and "x()" not in page and "(https://bbc.co.uk)" in page,
+      "web_fetch turns HTML into readable text")
+lines = []
+cmd = "python -c \"import time\nfor i in range(3): print('tick', i, flush=True); time.sleep(0.2)\"" \
+    if sys.platform == "win32" else "for i in 0 1 2; do echo tick $i; sleep 0.2; done"
+out = tb.run("run_command", {"command": cmd}, Ctx(on_output=lines.append))
+check("[exit code 0]" in out and len([l for l in lines if "tick" in l]) == 3, "run_command streams live output")
+slow = "ping -n 30 127.0.0.1" if sys.platform == "win32" else "sleep 30"
+t0 = time.time()
+out = tb.run("run_command", {"command": slow, "timeout_seconds": 5})
+check("timed out" in out and time.time() - t0 < 15, "run_command timeout kills the process")
+stop_at = time.time() + 2
+t0 = time.time()
+out = tb.run("run_command", {"command": slow}, Ctx(cancelled=lambda: time.time() > stop_at))
+check("stopped by the user" in out and time.time() - t0 < 10, "Stop kills a running command")
+r = tb.run("view_image", {"path": "ui.png"})
+check(isinstance(r, ToolResult) and r.images[0].startswith("data:image/"), "view_image returns the picture")
+try:
+    tb.run("view_image", {"path": "../../etc/passwd"})
+    check(False, "paths outside the project are refused")
+except ToolError:
+    check(True, "paths outside the project are refused")
+
+from afif_coder import skills as skillmod  # noqa: E402
+os.environ["AFIF_DATA"] = tempfile.mkdtemp()
+sk_dir = skillmod.user_skills_dir() / "demo"
+sk_dir.mkdir(parents=True)
+(sk_dir / "SKILL.md").write_text("---\nname: demo-skill\ndescription: >\n  Builds demo apps\n  for tests\n---\n# Demo\nStep one.")
+(sk_dir / "ref.md").write_text("reference text")
+found = skillmod.discover()
+check("demo-skill" in found and found["demo-skill"].description == "Builds demo apps for tests", "skill discovered with folded description")
+tb2 = Toolbox(str(shot), found, {})
+check("Step one." in tb2.run("use_skill", {"name": "demo-skill"}) and "ref.md" in tb2.run("use_skill", {"name": "demo-skill"}),
+      "use_skill returns instructions and file list")
+check(tb2.run("read_skill_file", {"skill": "demo-skill", "path": "ref.md"}) == "reference text", "read_skill_file")
+
+print("MCP client")
+fake_mcp = Path(tempfile.mkdtemp()) / "fake_mcp.py"
+fake_mcp.write_text('''import json, sys
+def send(m): sys.stdout.write(json.dumps(m) + "\\n"); sys.stdout.flush()
+for line in sys.stdin:
+    m = json.loads(line)
+    if m.get("method") == "initialize":
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+              "serverInfo": {"name": "fake", "version": "1"}}})
+        send({"jsonrpc": "2.0", "id": 99, "method": "ping"})
+    elif m.get("method") == "tools/list" and not m["params"].get("cursor"):
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"tools": [{"name": "inspect_android_package",
+              "description": "Inspect an APK", "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}],
+              "nextCursor": "p2"}})
+    elif m.get("method") == "tools/list":
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"tools": [{"name": "patch_binary", "inputSchema": {"type": "object"}}]}})
+    elif m.get("method") == "tools/call":
+        a = m["params"]["arguments"]
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"content": [{"type": "text", "text": "package com.afiftech.news from " + a.get("path", "")}],
+              "isError": False}})
+''')
+from afif_coder.mcp import MCPServer  # noqa: E402
+srv = MCPServer("rea", [sys.executable, str(fake_mcp)]).start()
+check([t["name"] for t in srv.tools] == ["inspect_android_package", "patch_binary"], "initialize + paginated tools/list")
+text, imgs, err = srv.call("inspect_android_package", {"path": "app.apk"})
+check(text == "package com.afiftech.news from app.apk" and not err, "tools/call returns text")
+sch = srv.schemas("rea")
+check(sch[0]["function"]["name"] == "rea__inspect_android_package" and sch[1]["function"]["parameters"]["properties"] == {},
+      "MCP tools exposed to models with a prefix")
+from afif_coder.agent import READ_ONLY_MCP  # noqa: E402
+check(READ_ONLY_MCP.match("inspect_android_package") and not READ_ONLY_MCP.match("patch_binary"),
+      "read-only REA tools run freely, others need approval")
+srv.stop()
+
+print("Continuity: auto skills, lessons, progress, saved chats")
+bundled = Path(__file__).resolve().parent.parent / "skills"
+os.environ["AFIF_DATA"] = tempfile.mkdtemp()
+import afif_coder.skills as sm  # noqa: E402
+sm.bundled_skills_dir = lambda: bundled
+allsk = sm.discover()
+check({"afif-app-rebuild", "reverse-engineer-anything", "afif-word", "afif-ui-check"} <= set(allsk), f"bundled skills found ({len(allsk)})")
+rb, rea = allsk["afif-app-rebuild"], allsk["reverse-engineer-anything"]
+check(rb.matches("Clone the Nabd app with my branding") and rb.matches("أريد تطبيق مثل نبض") and not rb.matches("fix this bug"),
+      "playbook triggers on clone requests (English and Arabic)")
+check(rea.matches("decompile my old APK") and not rea.matches("I already created the area"), "REA triggers without false hits on 'rea'")
+check(rea.mcp == "rea", "REA skill connects the REA server")
+pj = project()
+agent = Agent({"temperature": 0.2, "max_steps": 6}, lambda: b)
+agent.reset(str(pj))
+check("no progress notes yet" in agent.messages[0]["content"] and "afif-app-rebuild:" in agent.messages[0]["content"],
+      "system prompt lists skills and asks for progress notes")
+agent._auto_skills("please rebuild the Nabd news app as AFIF News")
+check(agent.loaded == ["afif-app-rebuild"] and "Ground rules" in agent.messages[-1]["content"], "matching skill loaded into the chat")
+agent._auto_skills("rebuild it again")
+check(agent.loaded == ["afif-app-rebuild"], "skill isn't loaded twice")
+tb3 = Toolbox(str(pj), allsk, {})
+tb3.run("record_lesson", {"skill": "afif-app-rebuild", "lesson": "Ammon rss.php returns HTML; use Google News search feed instead."})
+check("Ammon rss.php returns HTML" in tb3.run("use_skill", {"name": "afif-app-rebuild"}), "recorded lesson appears for every model")
+tb3.run("update_progress", {"content": "# Progress\n## Status\nSpec done, repo created.\n## Next steps\nFirst CI build."})
+from afif_coder.project import Project  # noqa: E402
+P = Project(str(pj))
+P.set_pinned(["afif-app-rebuild"])
+agent.reset(str(pj))
+sp = agent.messages[0]["content"]
+check("Spec done, repo created." in sp and 'pinned="true"' in sp and "Ammon rss.php" in sp,
+      "new chat sees progress notes, pinned skill and its lessons")
+agent.messages.append({"role": "user", "content": "hello"})
+agent.messages.append({"role": "assistant", "content": "hi"})
+agent.loaded = ["afif-word"]
+agent.save()
+again = Agent({}, None)
+again.reset(str(pj))
+shown = again.resume(P.load_chat())
+check([m["content"] for m in shown] == ["hello", "hi"] and again.loaded == ["afif-word"], "saved chat resumes with its loaded skills")
+check((pj / ".afif" / ".gitignore").read_text().startswith("chats/"), "chats are kept out of git")
+again.new_chat()
+check(P.load_chat() is None and list((pj / ".afif" / "chats").glob("chat-*.json")), "new chat archives the old one")
 
 print("Key storage")
 enc = backends.protect("sk-secret-123")

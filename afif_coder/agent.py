@@ -11,8 +11,11 @@ from pathlib import Path
 import requests
 from PySide6.QtCore import QObject, Signal
 
+from . import skills as skillmod
+from .project import Project
 from .backends import Backend, BackendError
-from .tools import Toolbox, ToolError
+from .mcp import MCPError, MCPManager
+from .tools import Ctx, Toolbox, ToolError, ToolResult, drive_connected
 
 SYSTEM_PROMPT = """You are AFIF Coder, a coding assistant made by AFIF-TECH. Your tools run on the user's own computer.
 You work inside one project folder: {root}
@@ -27,6 +30,12 @@ How to work:
 - Never invent file contents you have not read. Paths are relative to the project folder.
 - You can only change files or run commands by calling a tool. Never say you edited, created,
   ran or fixed something unless you called the tool and saw its result in this conversation.
+- Bundled command-line tools are on PATH for run_command: git, gh (GitHub CLI), node/npm/npx, python/pip,
+  java, rclone. {connections}
+- When a task matches a skill below, call use_skill first and follow it. Skills shown in full below are
+  already loaded. When you solve a new pitfall or the user corrects you, save it with record_lesson.
+- Keep the project's shared notes current with update_progress (status, decisions, repo, builds, next
+  steps). Another model may continue this work and relies on them.
 - Files the user attaches appear in their message. Large ones are also saved in the project's
   .afif-attachments folder; read them there with read_file.
 - Answer in the language the user writes in.
@@ -39,7 +48,9 @@ CLAIM = re.compile(r"\b(i|i've|i have)\s+(used|edited|updated|fixed|changed|crea
 TEXT_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 
 
-TOOL_NAMES = {t["function"]["name"] for t in Toolbox.schemas()}
+TOOL_NAMES = {t["function"]["name"] for t in Toolbox.schemas(drive=True)}
+READ_ONLY_MCP = re.compile(r"^(inspect|search|list|trace|get|read|describe|compare|find|explain|summari[sz]e|query|"
+                           r"analy[sz]e|check|show|diagnose|doctor|open|status|lookup|resolve)", re.I)
 FENCE = re.compile(r"```[a-zA-Z]*\s*(.*?)```", re.S)
 
 
@@ -98,6 +109,8 @@ class Agent(QObject):
     turn_started = Signal()
     tool_started = Signal(str, str, str)        # call_id, tool name, summary
     tool_finished = Signal(str, bool, str)      # call_id, ok, output
+    tool_progress = Signal(str, str)            # call_id, live output text
+    skill_loaded = Signal(str, str)             # skill name, how ("matched" | "pinned" | "requested")
     approval_needed = Signal(str, str, dict)    # call_id, tool name, args
     status = Signal(str)
     usage = Signal(int, int)                    # tokens in, tokens out for the last message (cloud)
@@ -108,6 +121,11 @@ class Agent(QObject):
         self.s = settings
         self.get_backend = get_backend          # callable -> Backend for the selected model
         self._backend: Backend | None = None
+        self.mcp = MCPManager(settings)
+        self.active_mcp: set[str] = set()
+        self.skills: dict = {}
+        self.loaded: list[str] = []
+        self.project: Project | None = None
         self.messages: list[dict] = []
         self.toolbox: Toolbox | None = None
         self._stop = threading.Event()
@@ -117,13 +135,65 @@ class Agent(QObject):
         self._resp = None
 
     def reset(self, root: str):
-        self.toolbox = Toolbox(root)
+        self.skills = skillmod.discover()
+        self.toolbox = Toolbox(root, self.skills, self.s)
+        self.project = Project(root)
+        self.active_mcp = set()
+        self.loaded = []
+        self.messages = [{"role": "system", "content": self.system_prompt()}]
+
+    def system_prompt(self) -> str:
+        root = str(self.toolbox.root)
+        conn = ["GitHub is connected (gh and git push work)." if self.s.get("github_user")
+                else "GitHub isn't connected yet; if you need it, ask the user to connect it in Connections.",
+                "Google Drive is connected (drive_* tools)." if drive_connected() else "Google Drive isn't connected."]
         prompt = SYSTEM_PROMPT.format(root=root, os=f"{platform.system()} {platform.release()}",
-                                      today=date.today().isoformat())
+                                      today=date.today().isoformat(), connections=" ".join(conn))
         notes = Path(root) / "CODER.md"
         if notes.is_file():
-            prompt += "\nProject instructions from CODER.md:\n" + notes.read_text(encoding="utf-8", errors="replace")[:8000]
-        self.messages = [{"role": "system", "content": prompt}]
+            prompt += "\nProject instructions from CODER.md:\n" + notes.read_text(encoding="utf-8", errors="replace")[:30000]
+        prog = self.project.progress() if self.project else ""
+        prompt += ("\n\nShared progress notes for this project (.afif/PROGRESS.md), written by whoever worked on it "
+                   "before. Continue from them:\n" + prog[:12000]) if prog.strip() else \
+            "\n\nThis project has no progress notes yet. Once you understand the task, create them with update_progress."
+        pinned = [n for n in (self.project.pinned() if self.project else []) if n in self.skills]
+        for n in pinned:
+            prompt += f"\n\n<skill name=\"{n}\" pinned=\"true\">\n{self.skills[n].full_text()}\n</skill>"
+        others = {k: v for k, v in self.skills.items() if k not in pinned}
+        prompt += skillmod.catalog_text(others)
+        return prompt
+
+    def resume(self, data: dict) -> list:
+        """Load a saved chat for this project; returns its messages for the UI to redraw."""
+        self.messages = [{"role": "system", "content": self.system_prompt()}] + list(data.get("messages", []))
+        self.loaded = [n for n in data.get("loaded_skills", []) if n in self.skills]
+        return self.messages[1:]
+
+    def save(self):
+        if self.project:
+            try:
+                self.project.save_chat(self.messages, self.s.get("model", ""), self.loaded)
+            except OSError:
+                pass
+
+    def new_chat(self):
+        if self.project:
+            self.project.archive_chat()
+        self.reset(str(self.toolbox.root))
+
+    def _auto_skills(self, text: str):
+        """Load matching skills for the model, so even models that never call use_skill follow them."""
+        pinned = self.project.pinned() if self.project else []
+        hits = [sk for n, sk in self.skills.items()
+                if n not in self.loaded and n not in pinned and sk.matches(text)]
+        for sk in hits[:2]:
+            self.loaded.append(sk.name)
+            note = (f"[AFIF Coder loaded the skill \"{sk.name}\" because it matches this request. "
+                    f"Follow it for this task.]\n<skill name=\"{sk.name}\">\n{sk.full_text()}\n</skill>")
+            if sk.mcp:
+                note += self._connect_mcp(sk.mcp)
+            self.messages.append({"role": "user", "content": note})
+            self.skill_loaded.emit(sk.name, "matched")
 
     def stop(self):
         self._stop.set()
@@ -146,6 +216,9 @@ class Agent(QObject):
         self._tin = self._tout = 0
         try:
             self._backend = self.get_backend()
+            text = user_content if isinstance(user_content, str) else " ".join(
+                p.get("text", "") for p in user_content if p.get("type") == "text")
+            self._auto_skills(text)
             self.messages.append({"role": "user", "content": user_content})
             nudged, used_tools = False, False
             self._seen: dict[str, list] = {}         # call signature -> [times, last_ok, last_output]
@@ -201,12 +274,13 @@ class Agent(QObject):
             err = "Stopped."
         if self._tin or self._tout:
             self.usage.emit(self._tin, self._tout)
+        self.save()
         self.finished.emit(err)
 
     def _chat_once(self) -> dict | None:
         self.turn_started.emit()
         self.status.emit("Thinking…")
-        turn = self._backend.stream(self.messages, Toolbox.schemas(), float(self.s.get("temperature", 0.2)),
+        turn = self._backend.stream(self.messages, self._schemas(), float(self.s.get("temperature", 0.2)),
                                     self.text_delta.emit, self._stop.is_set)
         if turn is None:
             return None
@@ -226,6 +300,39 @@ class Agent(QObject):
             if not c.get("id"):
                 c["id"] = f"call_{n}_{i}"
         return msg
+
+    def _schemas(self) -> list[dict]:
+        out = Toolbox.schemas(drive=drive_connected(), skills=bool(self.skills))
+        for name in sorted(self.active_mcp):
+            srv = self.mcp.running.get(name)
+            if srv and srv.alive():
+                out += srv.schemas(name)
+        return out
+
+    def _connect_mcp(self, name: str) -> str:
+        if name in self.active_mcp and self.mcp.running.get(name) and self.mcp.running[name].alive():
+            return f"\n\n[{name} tools are already connected.]"
+        self.status.emit(f"Starting {name.upper()}…")
+        try:
+            srv = self.mcp.get(name, str(self.toolbox.root))
+        except MCPError as e:
+            return f"\n\n[Couldn't start the {name} tool server: {e}. Continue without it and tell the user.]"
+        self.active_mcp.add(name)
+        return (f"\n\n[{name.upper()} is connected: {len(srv.tools)} tools are now available, named "
+                f"{name}__<tool>. AFIF Coder already installed and configured it (Node, JDK, JADX), so skip any "
+                f"setup or doctor steps and go straight to the analysis.]")
+
+    def _run_mcp(self, name: str, args: dict, call_id: str) -> tuple[bool, str, list]:
+        server, _, tool = name.partition("__")
+        srv = self.mcp.running.get(server)
+        if not srv or not srv.alive():
+            return False, f"The {server} tool server isn't running. Load its skill again to restart it.", []
+        real = next((t["name"] for t in srv.tools if f"{server}__{t['name']}"[:64] == name), tool)
+        try:
+            text, images, is_err = srv.call(real, args, cancelled=self._stop.is_set)
+        except MCPError as e:
+            return False, f"Error: {e}", []
+        return not is_err, (text if len(text) < 60_000 else text[:60_000] + "\n... [output cut at 60,000 characters]"), images
 
     def _do_tool(self, call: dict):
         fn = call["function"]
@@ -251,7 +358,9 @@ class Agent(QObject):
             self._reply(call_id, out)
             return
 
-        if name in Toolbox.NEEDS_APPROVAL and not self.auto_approve:
+        is_mcp = "__" in name and name.split("__")[0] in self.active_mcp
+        needs = name in Toolbox.NEEDS_APPROVAL or (is_mcp and not READ_ONLY_MCP.match(name.split("__", 1)[1]))
+        if needs and not self.auto_approve:
             self.status.emit("Waiting for your approval")
             self._approval.clear()
             self.approval_needed.emit(call_id, name, args)
@@ -262,18 +371,36 @@ class Agent(QObject):
                 return
 
         self.status.emit(f"Running {name}")
-        try:
-            out, ok = self.toolbox.run(name, args), True
-        except ToolError as e:
-            out, ok = f"Error: {e}", False
-        except Exception as e:
-            out, ok = f"Error: {type(e).__name__}: {e}", False
+        images: list[str] = []
+        if is_mcp:
+            ok, out, images = self._run_mcp(name, args, call_id)
+        else:
+            ctx = Ctx(on_output=lambda t, cid=call_id: self.tool_progress.emit(cid, t), cancelled=self._stop.is_set)
+            try:
+                res = self.toolbox.run(name, args, ctx)
+                if isinstance(res, ToolResult):
+                    out, images = res.text, res.images
+                else:
+                    out = res
+                ok = True
+            except ToolError as e:
+                out, ok = f"Error: {e}", False
+            except Exception as e:
+                out, ok = f"Error: {type(e).__name__}: {e}", False
+            if ok and name == "use_skill":
+                sk = self.skills.get(args.get("name")) or next(
+                    (v for k, v in self.skills.items() if k.lower() == str(args.get("name", "")).lower()), None)
+                if sk and sk.name not in self.loaded:
+                    self.loaded.append(sk.name)
+                    self.skill_loaded.emit(sk.name, "requested")
+                if sk and sk.mcp:
+                    out += self._connect_mcp(sk.mcp)
         seen[0] += 1
         seen[1], seen[2] = ok, out
         if ok and name in ("write_file", "edit_file"):
             self._seen = {k: v for k, v in self._seen.items() if v[1]}   # files changed: failures may now work
         self.tool_finished.emit(call_id, ok, out)
-        self._reply(call_id, out)
+        self._reply(call_id, out, images)
 
     def _fit_context(self, share: float = 0.7, keep: int = 2):
         """Local models have a small memory: trim old tool output when the chat gets near the limit."""
@@ -303,6 +430,9 @@ class Agent(QObject):
                 return
         self.status.emit("This chat is near the model's memory limit. Consider starting a new chat.")
 
-    def _reply(self, call_id: str, content: str):
-        self.messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+    def _reply(self, call_id: str, content: str, images: list | None = None):
+        m = {"role": "tool", "tool_call_id": call_id, "content": content}
+        if images:
+            m["_images"] = images
+        self.messages.append(m)
 

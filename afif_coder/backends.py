@@ -178,9 +178,24 @@ class OpenAIBackend(Backend):
         self.vision, self.echo_reasoning, self.temperature_ok, self.label = vision, echo_reasoning, temperature_ok, label
 
     def _prepare(self, messages):
-        out = []
+        out, pending = [], []
+
+        def flush():
+            if pending:
+                parts = [{"type": "text", "text": "Images returned by the tools above:"}]
+                parts += [{"type": "image_url", "image_url": {"url": u}} for u in pending]
+                out.append({"role": "user", "content": parts})
+                pending.clear()
+
         for m in messages:
+            if m["role"] != "tool":
+                flush()
             pm = _public(m)
+            if m["role"] == "tool" and m.get("_images"):
+                if self.vision:
+                    pending.extend(m["_images"])
+                else:
+                    pm["content"] = (pm["content"] or "") + "\n[This model can't see images; the picture was not shown.]"
             if not self.vision and isinstance(pm.get("content"), list):
                 pm["content"] = text_only(pm["content"])
             elif isinstance(pm.get("content"), list):
@@ -188,6 +203,7 @@ class OpenAIBackend(Backend):
             if self.echo_reasoning and m.get("_reasoning") and m["role"] == "assistant":
                 pm["reasoning_content"] = m["_reasoning"]
             out.append(pm)
+        flush()
         return out
 
     def stream(self, messages, tools, temperature, on_text, stopped) -> Turn | None:
@@ -325,8 +341,11 @@ class AnthropicBackend(Backend):
             elif r == "user":
                 push("user", self._user_blocks(m["content"]))
             elif r == "tool":
-                push("user", [{"type": "tool_result", "tool_use_id": m["tool_call_id"],
-                               "content": m["content"] or "(no output)"}])
+                content = m["content"] or "(no output)"
+                if m.get("_images"):
+                    content = [{"type": "text", "text": content}] + [
+                        self._user_blocks([{"type": "image_url", "image_url": {"url": u}}])[0] for u in m["_images"]]
+                push("user", [{"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": content}])
             elif r == "assistant":
                 if m.get("_anthropic"):
                     push("assistant", m["_anthropic"])
@@ -346,8 +365,18 @@ class AnthropicBackend(Backend):
 
     def stream(self, messages, tools, temperature, on_text, stopped) -> Turn | None:
         system, msgs = self.convert(messages)
-        body = {"model": self.model, "max_tokens": 16000, "system": system, "messages": msgs,
-                "tools": self._tools(tools), "stream": True}
+        tools_a = self._tools(tools)
+        # Prompt caching: tools + system + conversation so far are re-read at a fraction of the price.
+        if tools_a:
+            tools_a[-1] = dict(tools_a[-1], cache_control={"type": "ephemeral"})
+        if msgs and msgs[-1]["content"]:
+            msgs[-1] = dict(msgs[-1], content=list(msgs[-1]["content"]))
+            last = msgs[-1]["content"][-1]
+            if last.get("type") not in ("thinking", "redacted_thinking"):
+                msgs[-1]["content"][-1] = dict(last, cache_control={"type": "ephemeral"})
+        body = {"model": self.model, "max_tokens": 16000,
+                "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                "messages": msgs, "tools": tools_a, "stream": True}
         headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
         try:
             self.resp = requests.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))

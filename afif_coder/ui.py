@@ -19,6 +19,7 @@ from . import __version__
 from .agent import Agent, extract_text_calls
 from .attachments import Attachment, build_message, from_image_bytes, load as load_attachment
 from .backends import PROVIDERS, BackendError, LocalBackend, make_backend, unprotect
+from .connections import ConnectionsDialog, SkillsDialog
 from .engine import Engine
 from .models import Downloader, ModelsDialog, display_name, installed_models
 from .paths import data_dir
@@ -26,7 +27,10 @@ from .theme import DARK, LIGHT, reply_css, stylesheet
 
 KIND = {  # tool name -> label shown in the transcript
     "list_dir": "List", "read_file": "Read", "write_file": "Write", "edit_file": "Edit",
-    "find_files": "Find", "search_text": "Search", "run_command": "Run",
+    "find_files": "Find", "search_text": "Search", "run_command": "Run", "web_search": "Web",
+    "web_fetch": "Fetch", "view_image": "Look", "use_skill": "Skill", "read_skill_file": "Skill",
+    "record_lesson": "Learn", "update_progress": "Progress", "drive_list": "Drive", "drive_search": "Drive",
+    "drive_download": "Drive", "drive_upload": "Drive",
 }
 
 DEFAULTS = {
@@ -147,7 +151,9 @@ class ToolBlock(QFrame):
         h = QHBoxLayout(head)
         h.setContentsMargins(10, 6, 8, 6)
         h.setSpacing(10)
-        self.kind = QLabel(KIND.get(name, name))
+        self.kind = QLabel(KIND.get(name) or (name.split("__")[0].upper() if "__" in name else name))
+        if "__" in name:
+            summary = name.split("__", 1)[1] + ("  " + summary if summary else "")
         self.kind.setObjectName("toolKind")
         self.summ = QLabel()
         self.summ.setObjectName("toolSummary")
@@ -233,8 +239,23 @@ class ToolBlock(QFrame):
         self._set_state("done" if ok else ("declined" if output == "Declined" else "failed"), "ok" if ok else "bad")
         self.out.setPlainText(output)
         self.toggle.setVisible(bool(output))
+        if self.out.isVisible() and ok:
+            self._toggle()                     # collapse after a live run finishes
         if not ok and output != "Declined":
             self._toggle()   # show errors straight away
+
+    def append_output(self, text: str):
+        """Live output from a running command."""
+        if not self.out.isVisible():
+            self.out.setVisible(True)
+            self.toggle.setVisible(True)
+            self.toggle.setText("Hide output")
+        self.out.moveCursor(self.out.textCursor().MoveOperation.End)
+        self.out.insertPlainText(text)
+        doc = self.out.document()
+        if doc.characterCount() > 200_000:
+            self.out.setPlainText(self.out.toPlainText()[-150_000:])
+        self.out.verticalScrollBar().setValue(self.out.verticalScrollBar().maximum())
 
     def _toggle(self):
         vis = not self.out.isVisible()
@@ -376,6 +397,8 @@ class MainWindow(QMainWindow):
         self.dot = QLabel("●", objectName="statusDot")
         self.conn = QLabel("", objectName="muted")
         self.new_btn = QPushButton("New chat")
+        self.skills_btn = QPushButton("Skills", objectName="flat")
+        self.conn_btn = QPushButton("Connections", objectName="flat")
         self.set_btn = QPushButton("Settings", objectName="flat")
         h.addWidget(brand)
         h.addWidget(sub)
@@ -386,6 +409,8 @@ class MainWindow(QMainWindow):
         h.addWidget(self.conn)
         h.addWidget(self.model)
         h.addWidget(self.new_btn)
+        h.addWidget(self.skills_btn)
+        h.addWidget(self.conn_btn)
         h.addWidget(self.set_btn)
         v.addWidget(hdr)
 
@@ -502,6 +527,10 @@ class MainWindow(QMainWindow):
         a.text_delta.connect(self._on_delta)
         a.tool_started.connect(self._on_tool_start)
         a.tool_finished.connect(self._on_tool_done)
+        a.tool_progress.connect(lambda cid, t: self.tools.get(cid) and self.tools[cid].append_output(t))
+        a.skill_loaded.connect(self._on_skill)
+        self.skills_btn.clicked.connect(self.open_skills)
+        self.conn_btn.clicked.connect(self.open_connections)
         a.approval_needed.connect(self._on_approval)
         a.status.connect(self.status.setText)
         a.usage.connect(lambda i, o: setattr(self, "last_usage", (i, o)))
@@ -551,21 +580,101 @@ class MainWindow(QMainWindow):
         self.project_btn.setText(Path(path).name or path)
         self.project_btn.setToolTip(path)
         self.stack.setCurrentIndex(1)
-        self.new_chat()
+        self.agent.reset(path)
+        self._clear_log()
+        saved = self.agent.project.load_chat()
+        if saved and saved.get("messages"):
+            self._redraw(self.agent.resume(saved))
+            n = sum(1 for m in saved["messages"] if m["role"] == "user" and not str(m.get("content", "")).startswith("[AFIF"))
+            self.status.setText(f"Continuing your last chat in this project ({n} message{'s' * (n != 1)}). "
+                                "New chat starts fresh; progress notes carry over.")
+        else:
+            self._after_reset()
 
     def new_chat(self):
         if self.busy or not self.s["project"]:
             return
-        self.agent.reset(self.s["project"])
+        self.agent.new_chat()
+        self._clear_log()
+        self._after_reset()
+
+    def _clear_log(self):
         while self.log.count() > 1:
             item = self.log.takeAt(1)
             if item.widget():
                 item.widget().deleteLater()
         self.tools.clear()
         self.reply = None
-        hint = "CODER.md found and loaded. " if (Path(self.s["project"]) / "CODER.md").is_file() else ""
-        self.status.setText(hint + f"Working in {self.s['project']}")
+
+    def _after_reset(self):
+        bits = []
+        if (Path(self.s["project"]) / "CODER.md").is_file():
+            bits.append("CODER.md loaded")
+        if self.agent.project and self.agent.project.progress().strip():
+            bits.append("progress notes loaded")
+        pinned = self.agent.project.pinned() if self.agent.project else []
+        if pinned:
+            bits.append("pinned: " + ", ".join(pinned))
+        self.status.setText((" · ".join(bits) + " · " if bits else "") + f"Working in {self.s['project']}")
         self.input.setFocus()
+
+    def _redraw(self, messages: list):
+        """Show a saved conversation compactly."""
+        results = {m["tool_call_id"]: m for m in messages if m["role"] == "tool"}
+        for m in messages:
+            c = m.get("content")
+            if m["role"] == "user":
+                text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c if p.get("type") == "text")
+                if text.startswith("[AFIF Coder loaded the skill"):
+                    name = text.split('"')[1] if '"' in text else "skill"
+                    self._on_skill(name, "matched")
+                elif not text.startswith("You described a change but did not call"):
+                    self._add(UserBlock(text[:4000]))
+            elif m["role"] == "assistant":
+                if c and c.strip():
+                    rb = ReplyBlock(self.css)
+                    rb.set_text(c)
+                    self._add(rb)
+                for call in m.get("tool_calls") or []:
+                    fn = call["function"]
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except ValueError:
+                        args = {}
+                    blk = ToolBlock(call["id"], fn["name"], self.agent.toolbox.summary(fn["name"], args)
+                                    if self.agent.toolbox else "")
+                    res = results.get(call["id"])
+                    out = (res or {}).get("content", "")
+                    blk.finish(bool(res) and not str(out).startswith(("Error", "Not run", "The user declined")), out)
+                    self._add(blk)
+        sep = QLabel("Earlier in this chat (saved). Continue below.")
+        sep.setObjectName("muted")
+        self._add(sep)
+
+    def _on_skill(self, name: str, how: str):
+        why = {"matched": "matches your request", "pinned": "pinned to this project",
+               "requested": "loaded by the model"}.get(how, how)
+        lbl = QLabel(f"Skill: {name} ({why})")
+        lbl.setObjectName("muted")
+        self._add(lbl)
+
+    def open_skills(self):
+        if self.busy:
+            return
+        SkillsDialog(self.agent.project, self).exec()
+        if self.s.get("project"):
+            msgs = self.agent.messages[1:]
+            self.agent.reset(self.s["project"])          # pick up pins, new skills and lessons
+            self.agent.messages += msgs
+            self._after_reset()
+
+    def open_connections(self):
+        dlg = ConnectionsDialog(self.s, self)
+        dlg.open_project.connect(self.open_project)
+        dlg.exec()
+        save_settings(self.s)
+        if self.s.get("project") and not self.busy:
+            self.agent.messages[0]["content"] = self.agent.system_prompt()
 
     # ---------- models ----------
     def _cloud_choices(self) -> list[tuple[str, str]]:
@@ -791,7 +900,7 @@ class MainWindow(QMainWindow):
         self.send.setObjectName("danger" if on else "primary")
         self.send.style().unpolish(self.send)
         self.send.style().polish(self.send)
-        for w in (self.model, self.new_btn, self.project_btn, self.set_btn, self.attach):
+        for w in (self.model, self.new_btn, self.project_btn, self.set_btn, self.attach, self.skills_btn, self.conn_btn):
             w.setEnabled(not on)
 
     def _add(self, w: QWidget):
@@ -872,6 +981,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         if self.busy:
             self.agent.stop()
+        self.agent.save()
+        self.agent.mcp.stop_all()
         for mid in list(self.dl.cancel_flags):
             self.dl.cancel(mid)            # partial downloads resume next time
         self.engine.stop()

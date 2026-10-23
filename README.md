@@ -36,7 +36,33 @@ Manus isn't included: it's a hosted agent that works on its own servers, so it c
 
 ## Attaching files
 
-Click **Attach files**, drag files onto the window, or paste an image. Text and code files, PDF, Word (.docx) and Excel (.xlsx) are read into the message. Files over about 60,000 characters are also saved in the project's `.afif-attachments` folder so the model can read the rest. Images are sent to models that can see them (Claude, Gemini); local models get a note instead.
+Click **Attach files**, drag files onto the window, or paste an image. Text and code files, PDF, Word (.docx) and Excel (.xlsx) are read into the message. Files over about 60,000 characters are also saved in the project's `.afif/attachments` folder so the model can read the rest. Images are sent to models that can see them (Claude, Gemini); local models get a note instead.
+
+## Building and cloning apps (skills, GitHub, Drive, REA)
+
+AFIF Coder 1.2 can follow the **AFIF-TECH App Rebuild playbook** end to end with any model:
+
+- **Skills** (header → Skills): built-in skills for the App Rebuild playbook, REA reverse engineering,
+  Word, Excel, PowerPoint, PDF and headless UI checks. A skill loads automatically when your message
+  matches it ("clone…", "rebuild…", "decompile my APK…"), so even small models get the instructions.
+  Tick **Always use in this project** to give a skill to every chat in a project. Add your own skill
+  folders (a `SKILL.md` with `name` and `description`) from the same window.
+- **Lessons learned:** when a model hits a pitfall or you correct it, it records the lesson on the skill.
+  Every model sees those lessons the next time it uses the skill. Review or edit them under Skills → Lessons.
+- **Continuing work:** each project keeps `.afif/PROGRESS.md` (goal, status, decisions, repo and builds,
+  next steps), updated by the models. A new chat, a different model, or another AI tool reads it first.
+  Reopening a project continues its last chat; **New chat** starts fresh (the old one is archived in `.afif/chats`).
+- **Connections** (header → Connections): sign in to **GitHub** (browser code, via the bundled GitHub CLI)
+  and **Google Drive** (browser approval, via the bundled rclone). Models can then create repos, push,
+  follow Actions builds (`gh run watch`), download releases, and read or upload Drive files.
+  **Open a repository…** clones one of your repos and opens it as the project.
+- **REA:** bundled with Node.js, Java JDK 21 and the pinned JADX engine. It connects automatically when
+  the REA skill loads. Use it only on apps you own or are authorised to analyse.
+- **Bundled tools** (full install): Git, GitHub CLI, Node.js 24, Python 3.12 with python-docx, openpyxl,
+  python-pptx, reportlab, pypdf and Playwright with Chromium, Java JDK 21, rclone. They're on PATH for
+  every command the models run; nothing is added to your system PATH.
+- **Web:** models can search the web and read pages (DuckDuckGo by default; add a Brave Search key in
+  Connections for steadier results), and look at screenshots they take (Claude and Gemini).
 
 ## Using it
 
@@ -47,6 +73,7 @@ Click **Attach files**, drag files onto the window, or paste an image. Text and 
 - Put a `CODER.md` file in a project root with standing instructions (coding style, how to build, what not to touch). It's loaded into every new chat.
 - **Settings**: graphics card on/off, context length, temperature, step limit, theme.
 - Choosing a cloud model unloads the local model to free your PC's memory.
+- Commands can run for up to an hour with live output (builds, `gh run watch`); **Stop** ends them.
 
 The engine uses your graphics card through Vulkan (NVIDIA, AMD and Intel) and falls back to the CPU automatically if that doesn't work.
 

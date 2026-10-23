@@ -26,7 +26,7 @@ UninstallDisplayIcon={app}\AFIF-Coder.exe
 UninstallDisplayName=AFIF Coder
 OutputDir=..\dist
 OutputBaseFilename=AFIF-Coder-Setup-{#AppVersion}
-Compression=lzma2/ultra64
+Compression=lzma2/max
 SolidCompression=yes
 LicenseFile=license.txt
 CloseApplications=yes
@@ -36,7 +36,19 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-WelcomeLabel2=This will install [name/ver] on your computer.%n%nAFIF Coder is a coding assistant with its own built-in AFIF Engine. Local models run entirely on this PC, need no account and have no usage limits. You can also connect Claude, Gemini or DeepSeek with your own API key.%n%nAfter installing, AFIF Coder will offer to download a local model (1-18 GB, once).
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nAFIF Coder is a coding assistant with its own built-in AFIF Engine. Local models run entirely on this PC, need no account and have no usage limits. You can also connect Claude, Gemini or DeepSeek with your own API key.%n%nThe full installation adds everything needed to build and clone apps: Git, GitHub CLI, Node.js, REA with Java and JADX, rclone for Google Drive, and Python with Playwright.%n%nAfter installing, AFIF Coder will offer to download a local model (1-18 GB, once).
+
+[Types]
+Name: "full"; Description: "Full: everything for building and cloning apps (recommended)"
+Name: "compact"; Description: "AFIF Coder only (chat, models and skills)"
+Name: "custom"; Description: "Choose components"; Flags: iscustom
+
+[Components]
+Name: "main"; Description: "AFIF Coder, AI engine and skills"; Types: full compact custom; Flags: fixed
+Name: "dev"; Description: "Developer tools: Git, GitHub CLI, Node.js, Python with Word/Excel/PowerPoint/PDF libraries"; Types: full
+Name: "dev\browser"; Description: "Chromium for UI screenshots (Playwright)"; Types: full
+Name: "rea"; Description: "REA reverse-engineering toolkit (REA, Java JDK 21, JADX engine)"; Types: full
+Name: "drive"; Description: "Google Drive connector (rclone)"; Types: full
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
@@ -45,6 +57,18 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "..\dist\AFIF-Coder\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\engine\*"; DestDir: "{app}\engine"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
+Source: "..\skills\*"; DestDir: "{app}\skills"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\THIRD-PARTY.txt"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "..\tools\VERSIONS.json"; DestDir: "{app}\tools"; Flags: ignoreversion
+Source: "..\tools\git\*"; DestDir: "{app}\tools\git"; Components: dev; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\gh\*"; DestDir: "{app}\tools\gh"; Components: dev; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\python\*"; DestDir: "{app}\tools\python"; Components: dev; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\ms-playwright\*"; DestDir: "{app}\tools\ms-playwright"; Components: dev\browser; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\node\*"; DestDir: "{app}\tools\node"; Components: dev or rea; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\rea\*"; DestDir: "{app}\tools\rea"; Components: rea; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\jdk\*"; DestDir: "{app}\tools\jdk"; Components: rea; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\jadx\*"; DestDir: "{app}\tools\jadx"; Components: rea; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\tools\rclone\*"; DestDir: "{app}\tools\rclone"; Components: drive; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\AFIF Coder"; Filename: "{app}\AFIF-Coder.exe"; Comment: "Local AI coding assistant"
@@ -55,6 +79,10 @@ Filename: "{app}\AFIF-Coder.exe"; Description: "Start AFIF Coder"; Flags: nowait
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/f /im llama-server.exe /t"; Flags: runhidden; RunOnceId: "StopEngine"
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\tools"
+Type: filesandordirs; Name: "{app}\skills"
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
