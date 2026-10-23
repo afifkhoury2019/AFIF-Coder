@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from .backends import PROVIDERS, BackendError, list_models, protect, unprotect
-from .paths import models_dir, total_ram_gb
+from .paths import bundled_models_dir, models_dir, total_ram_gb
 
 HF = "https://huggingface.co"
 
@@ -22,6 +22,41 @@ HF = "https://huggingface.co"
 # "sources" are Hugging Face paths tried in order; the file is saved under "file".
 # "tools": "good" = reliable tool use, "fair" = works, with AFIF Coder's recovery for text-style calls.
 CATALOG = [
+    {"id": "qwen3-0.6b", "maker": "Qwen", "name": "Qwen3 0.6B (tiny)", "size": 0.48, "ram": 2, "tools": "fair",
+     "about": "The lightest model: half a gigabyte, answers fast on any PC. Good for chat and tiny edits only.",
+     "file": "Qwen3-0.6B-Q4_K_M.gguf",
+     "sources": ["unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf",
+                 "bartowski/Qwen_Qwen3-0.6B-GGUF/Qwen_Qwen3-0.6B-Q4_K_M.gguf"]},
+    {"id": "llama-3.2-1b", "maker": "Meta", "name": "Llama 3.2 1B", "size": 0.81, "ram": 3, "tools": "fair",
+     "about": "Meta's smallest model. Very quick on a laptop processor; simple tasks.",
+     "file": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+     "sources": ["bartowski/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+                 "unsloth/Llama-3.2-1B-Instruct-GGUF/Llama-3.2-1B-Instruct-Q4_K_M.gguf"]},
+    {"id": "gemma-3-1b", "maker": "Google", "name": "Gemma 3 1B", "size": 0.81, "ram": 3, "tools": "fair",
+     "about": "Google's smallest open model. Quick, good at explaining; weak with tools.",
+     "file": "gemma-3-1b-it-Q4_K_M.gguf",
+     "sources": ["unsloth/gemma-3-1b-it-GGUF/gemma-3-1b-it-Q4_K_M.gguf",
+                 "bartowski/google_gemma-3-1b-it-GGUF/google_gemma-3-1b-it-Q4_K_M.gguf"]},
+    {"id": "qwen3-1.7b", "maker": "Qwen", "name": "Qwen3 1.7B (AFIF Lite)", "size": 1.1, "ram": 4, "tools": "good",
+     "about": "Built into the installer. The best tool user among the light models; runs on a laptop processor.",
+     "file": "Qwen3-1.7B-Q4_K_M.gguf",
+     "sources": ["unsloth/Qwen3-1.7B-GGUF/Qwen3-1.7B-Q4_K_M.gguf",
+                 "bartowski/Qwen_Qwen3-1.7B-GGUF/Qwen_Qwen3-1.7B-Q4_K_M.gguf"]},
+    {"id": "llama-3.2-3b", "maker": "Meta", "name": "Llama 3.2 3B", "size": 2.0, "ram": 6, "tools": "good",
+     "about": "Light, with dependable tool use. A good step up from the 1-2B models.",
+     "file": "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+     "sources": ["bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+                 "unsloth/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf"]},
+    {"id": "granite-4-micro", "maker": "IBM", "name": "Granite 4.0 Micro (3B)", "size": 2.1, "ram": 6, "tools": "good",
+     "about": "IBM's small model made for tool calling and agents. Light and reliable.",
+     "file": "granite-4.0-micro-Q4_K_M.gguf",
+     "sources": ["unsloth/granite-4.0-micro-GGUF/granite-4.0-micro-Q4_K_M.gguf",
+                 "ibm-granite/granite-4.0-micro-GGUF/granite-4.0-micro-Q4_K_M.gguf"]},
+    {"id": "qwen3-4b", "maker": "Qwen", "name": "Qwen3 4B Instruct", "size": 2.5, "ram": 8, "tools": "good",
+     "about": "The strongest light model: answers directly (no long thinking) and uses tools well.",
+     "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+     "sources": ["unsloth/Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                 "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf"]},
     {"id": "qwen2.5-coder-1.5b", "maker": "Qwen", "name": "Qwen2.5 Coder 1.5B", "size": 0.92, "ram": 4, "tools": "fair",
      "about": "Very light. Runs on almost any PC, but only handles simple tasks.",
      "file": "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
@@ -81,7 +116,7 @@ CATALOG = [
      "sources": ["unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
                  "lmstudio-community/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"]},
 ]
-RECOMMEND = ["qwen2.5-coder-1.5b", "qwen2.5-coder-3b", "qwen2.5-coder-7b"]   # by RAM, smallest first
+RECOMMEND = ["qwen3-1.7b", "qwen3-4b", "qwen2.5-coder-7b"]   # by RAM, smallest first
 
 
 def urls_of(m: dict) -> list[str]:
@@ -109,7 +144,12 @@ def parse_hf_link(url: str) -> dict | None:
 
 
 def installed_models(extra: list[str]) -> list[Path]:
-    found = sorted(models_dir().glob("*.gguf"), key=lambda p: p.name.lower())
+    """Built-in model(s) first, then downloaded ones, then files the user added."""
+    built = sorted(bundled_models_dir().glob("*.gguf"), key=lambda p: p.name.lower()) \
+        if bundled_models_dir().is_dir() else []
+    have = {p.name for p in built}
+    found = built + [p for p in sorted(models_dir().glob("*.gguf"), key=lambda p: p.name.lower())
+                     if p.name not in have]
     for e in extra:
         p = Path(e)
         if p.is_file() and p not in found:
@@ -132,14 +172,18 @@ def recommended() -> dict:
     ram = total_ram_gb()
     by_id = {m["id"]: m for m in CATALOG}
     best = by_id[RECOMMEND[0]]
-    for mid in RECOMMEND:              # never auto-recommend the very large ones
+    import os
+    picks = RECOMMEND[:1] if (os.cpu_count() or 4) <= 4 else RECOMMEND   # 2-core laptops: keep it light
+    for mid in picks:                  # never auto-recommend the very large ones
         if ram >= by_id[mid]["ram"] - 0.6:     # "16 GB" PCs report ~15.4
             best = by_id[mid]
     return best
 
 
 class Downloader(QObject):
-    progress = Signal(str, int, int, float)    # id, done bytes, total bytes, bytes/s
+    # object, not int: Qt's int is 32-bit, and byte counts above 2 GB overflowed it (OverflowError every
+    # progress update while downloading a large model, seen as hundreds of crashes in the report)
+    progress = Signal(str, object, object, float)    # id, done bytes, total bytes, bytes/s
     done = Signal(str, str)                    # id, error ("" = ok)
 
     def __init__(self):
@@ -264,7 +308,11 @@ class ModelRow(QFrame):
         self.refresh()
 
     def path(self) -> Path:
-        return models_dir() / self.m["file"]
+        built_in = bundled_models_dir() / self.m["file"]
+        return built_in if built_in.is_file() else models_dir() / self.m["file"]
+
+    def built_in(self) -> bool:
+        return self.path().parent == bundled_models_dir()
 
     def refresh(self):
         busy = self.dlg.dl.active(self.m["id"])
@@ -272,9 +320,10 @@ class ModelRow(QFrame):
             self.btn.setText("Cancel")
             self.btn.setObjectName("danger")
         elif self.path().exists():
-            self.btn.setText("Delete")
+            self.btn.setText("Built in" if self.built_in() else "Delete")
+            self.btn.setEnabled(not self.built_in())
             self.btn.setObjectName("flat")
-            self.info.setText("Installed")
+            self.info.setText("Included with AFIF Coder: works with no download" if self.built_in() else "Installed")
             self.info.setVisible(True)
             self.bar.setVisible(False)
         else:
@@ -338,7 +387,8 @@ class CloudCard(QFrame):
         v.setContentsMargins(12, 10, 12, 10)
         v.setSpacing(6)
         top = QHBoxLayout()
-        title = QLabel(self.p.label if not self.p.custom else "Other OpenAI-compatible service")
+        title = QLabel((self.p.label if not self.p.custom else "Other OpenAI-compatible service")
+                       + ("  ·  FREE" if self.p.free else ""))
         title.setObjectName("toolKind")
         top.addWidget(title)
         top.addStretch(1)
@@ -359,8 +409,10 @@ class CloudCard(QFrame):
             form.addRow("Address", self.base)
         self.key = QLineEdit(unprotect(self.cfg.get("key", "")))
         self.key.setEchoMode(QLineEdit.Password)
-        self.key.setPlaceholderText("Optional for local servers" if self.p.custom else "Paste your key")
-        form.addRow("API key", self.key)
+        self.key.setPlaceholderText("Optional for local servers" if self.p.custom else
+                                    "Not needed: uses your GitHub sign-in" if self.p.keyless else "Paste your key")
+        if not self.p.keyless:
+            form.addRow("API key", self.key)
         if self.p.custom:
             self.names = QLineEdit(self.cfg.get("pinned", ""))
             self.names.setPlaceholderText("Model names, separated by commas (blank = list from the service)")
@@ -373,7 +425,7 @@ class CloudCard(QFrame):
         self.status = QLabel(self._summary())
         self.status.setProperty("muted", True)
         self.status.setWordWrap(True)
-        self.save = QPushButton("Save and connect")
+        self.save = QPushButton("Check models" if self.p.keyless else "Save and connect")
         self.save.clicked.connect(self._save)
         self.remove = QPushButton("Remove")
         self.remove.setObjectName("flat")
@@ -386,6 +438,10 @@ class CloudCard(QFrame):
 
     def _summary(self) -> str:
         n = len(self.cfg.get("models") or [])
+        if self.p.keyless:
+            if not self.dlg.s.get("github_user"):
+                return "Sign in to GitHub in Connections, then click Check models."
+            return f"Uses GitHub sign-in {self.dlg.s['github_user']}; {n or len(self.p.defaults)} models."
         if self.cfg.get("key") or (self.p.custom and self.cfg.get("base_url")):
             return f"Connected, {n} model{'s' if n != 1 else ''} available." if n else "Saved."
         return "Not set up."
@@ -396,7 +452,7 @@ class CloudCard(QFrame):
             self.cfg["pinned"] = self.names.text().strip()
             self.cfg["vision"] = self.vision.isChecked()
         self.cfg["key"] = protect(self.key.text().strip())
-        if not self.cfg["key"] and not self.p.custom:
+        if not self.cfg["key"] and not self.p.custom and not self.p.keyless:
             self.status.setText("Paste a key first.")
             return
         self.status.setText("Checking…")
@@ -487,10 +543,11 @@ class ModelsDialog(QDialog):
         cloud = QWidget()
         cv = QVBoxLayout(cloud)
         cv.setContentsMargins(0, 8, 0, 0)
-        csub = QLabel("Cloud models run on the provider's servers with your own API key. They're far stronger "
-                      "than local models, but each message is billed by the provider (Gemini has a free tier). "
-                      "Your files only leave this PC when the model reads them. Keys are stored encrypted for "
-                      "your Windows account.")
+        csub = QLabel("Cloud models run on the provider's servers with your own API key. The FREE ones at the top "
+                      "cost nothing (each has daily limits); connect two or three and pick \"Free Auto\" in the model "
+                      "list: it switches to the next one whenever one is busy or out of quota. Claude and DeepSeek "
+                      "are billed per use. Your files only leave this PC when the model reads them. Keys are "
+                      "stored encrypted for your Windows account.")
         csub.setWordWrap(True)
         csub.setProperty("muted", True)
         cv.addWidget(csub)
@@ -499,7 +556,7 @@ class ModelsDialog(QDialog):
         cinner = QWidget(objectName="root")
         ccol = QVBoxLayout(cinner)
         ccol.setSpacing(8)
-        for pid in PROVIDERS:
+        for pid in sorted(PROVIDERS, key=lambda k: (not PROVIDERS[k].free, PROVIDERS[k].custom)):
             ccol.addWidget(CloudCard(pid, self))
         ccol.addStretch(1)
         carea.setWidget(cinner)

@@ -81,6 +81,7 @@ class Card(QFrame):
 
 class ConnectionsDialog(QDialog):
     open_project = Signal(str)
+    claude_code = Signal()
 
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
@@ -118,6 +119,16 @@ class ConnectionsDialog(QDialog):
         self.dr_in = self.dr.button("Connect Google Drive", self._drive_login, primary=True)
         self.dr_out = self.dr.button("Disconnect", self._drive_logout)
         col.addWidget(self.dr)
+
+        from . import claude_code as cc
+        self.cc = Card("Claude Code, free on this PC", "Runs Anthropic's Claude Code agent in its own window, using the "
+                       "model loaded in the AFIF Engine instead of an Anthropic account: no tokens, no bill (like "
+                       "\"ollama launch claude\", with nothing else to install). Claude Code is downloaded from npm "
+                       "the first time (about 1 minute). It's slow on a laptop processor: Claude Code sends ~20,000 "
+                       "tokens of instructions before its first answer.")
+        self.cc.state.setText("Installed" if cc.installed() else "Not installed yet")
+        self.cc.button("Start Claude Code", lambda: (self.claude_code.emit(), self.accept()), primary=True)
+        col.addWidget(self.cc)
 
         self.rea = Card("REA (Reverse Engineer Anything)", "Evidence-based analysis of your own APKs, Windows "
                         "programs and Electron apps. Connects automatically when a model loads the REA skill.")

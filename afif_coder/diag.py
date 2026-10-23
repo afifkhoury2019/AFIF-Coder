@@ -58,7 +58,21 @@ def event(kind: str, **fields):
         pass
 
 
+_repeats: dict[str, list] = {}       # crash text -> [count, last time logged]
+
+
 def error(kind: str, exc: BaseException | None = None, **fields):
+    if kind == "crash":
+        # The same crash repeating (e.g. on every progress update) is logged once, then counted.
+        key = f"{type(exc).__name__}: {exc}|{fields.get('where', '')}"
+        rec = _repeats.setdefault(key, [0, 0.0])
+        rec[0] += 1
+        now = time.time()
+        if rec[0] > 1 and now - rec[1] < 300 and rec[0] % 100:
+            return
+        rec[1] = now
+        if rec[0] > 1:
+            fields["repeats"] = rec[0]
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) if exc else ""
     event(kind, level="error", error=f"{type(exc).__name__}: {exc}" if exc else fields.pop("error", ""),
           traceback=tb[-6000:], **fields)

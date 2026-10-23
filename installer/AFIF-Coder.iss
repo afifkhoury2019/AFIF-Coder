@@ -36,7 +36,7 @@ RestartApplications=no
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-WelcomeLabel2=This will install [name/ver] on your computer.%n%nAFIF Coder is a coding assistant with its own built-in AFIF Engine. Local models run entirely on this PC, need no account and have no usage limits. You can also connect Claude, Gemini or DeepSeek with your own API key.%n%nThe full installation adds everything needed to build and clone apps: Git, GitHub CLI, Node.js, REA with Java and JADX, rclone for Google Drive, and Python with Playwright.%n%nAfter installing, AFIF Coder will offer to download a local model (1-18 GB, once).
+WelcomeLabel2=This will install [name/ver] on your computer.%n%nAFIF Coder is a coding assistant with its own built-in AFIF Engine. Local models run entirely on this PC, need no account and have no usage limits. A light model (Qwen3 1.7B) is built in, so it works straight away. You can also use free cloud models (Gemini, Groq, GitHub Models, Mistral, OpenRouter) with "Free Auto", or Claude and DeepSeek with your own API key.%n%nThe full installation adds everything needed to build and clone apps: Git, GitHub CLI, Node.js, REA with Java and JADX, rclone for Google Drive, and Python with Playwright.%n%nBigger local models (2-18 GB) can be downloaded later from Models.
 
 [Types]
 Name: "full"; Description: "Full: everything for building and cloning apps (recommended)"
@@ -45,6 +45,7 @@ Name: "custom"; Description: "Choose components"; Flags: iscustom
 
 [Components]
 Name: "main"; Description: "AFIF Coder, AI engine and skills"; Types: full compact custom; Flags: fixed
+Name: "lite"; Description: "Built-in light model: Qwen3 1.7B (1.1 GB), works right away with no download"; Types: full compact
 Name: "dev"; Description: "Developer tools: Git, GitHub CLI, Node.js, Python with Word/Excel/PowerPoint/PDF libraries"; Types: full
 Name: "dev\browser"; Description: "Chromium for UI screenshots (Playwright)"; Types: full
 Name: "rea"; Description: "REA reverse-engineering toolkit (REA, Java JDK 21, JADX engine)"; Types: full
@@ -58,6 +59,7 @@ Source: "..\dist\AFIF-Coder\*"; DestDir: "{app}"; Flags: ignoreversion recursesu
 Source: "..\engine\*"; DestDir: "{app}\engine"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; DestName: "README.txt"; Flags: ignoreversion
 Source: "..\skills\*"; DestDir: "{app}\skills"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\models\*.gguf"; DestDir: "{app}\models"; Components: lite; Flags: ignoreversion nocompression
 Source: "..\tools\THIRD-PARTY.txt"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\tools\VERSIONS.json"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\tools\git\*"; DestDir: "{app}\tools\git"; Components: dev; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -83,6 +85,7 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/f /im llama-server.exe /t"; Flags:
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\tools"
 Type: filesandordirs; Name: "{app}\skills"
+Type: filesandordirs; Name: "{app}\models"
 
 [Code]
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

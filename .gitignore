@@ -6,3 +6,4 @@ engine/
 testmodel/
 *.spec
 *.zip
+models/

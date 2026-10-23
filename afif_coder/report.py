@@ -21,7 +21,8 @@ from .paths import data_dir
 LABEL = {"message": "Message", "turn": "Model reply", "tool": "Tool", "engine_load": "Model load",
          "warm_up": "Warm-up", "message_error": "Error", "crash": "Crash", "download": "Download",
          "connection": "Sign-in", "mcp_start": "REA start", "skill": "Skill", "stop": "Stop",
-         "app_start": "App start", "message_start": "Message sent"}
+         "app_start": "App start", "message_start": "Message sent", "free_auto_switch": "Free Auto switch",
+         "engine_bench": "GPU vs CPU test", "claude_code": "Claude Code"}
 
 
 def _med(xs):
@@ -36,7 +37,7 @@ def summarize(events: list[dict]) -> dict:
         by_model.setdefault(e.get("model", "?").split(":")[-1].split("\\")[-1], []).append(e)
     models = []
     for m, es in by_model.items():
-        models.append({"model": m, "messages": len(es), "errors": sum(1 for e in es if e.get("level") == "error"),
+        models.append({"model": m, "messages": len(es), "local": any(e.get("backend") == "LocalBackend" for e in es), "errors": sum(1 for e in es if e.get("level") == "error"),
                        "first_words_s": _med(e.get("first_words_s") for e in es),
                        "total_s": _med(e.get("seconds") for e in es),
                        "tokens_per_s": _med(e.get("tokens_per_s") for e in es)})
@@ -45,8 +46,10 @@ def summarize(events: list[dict]) -> dict:
     problems = [e for e in events if e.get("level") in ("error", "slow") and e["kind"] not in ("message", "turn")]
     return {
         "messages": len(msgs),
-        "errors": sum(1 for e in events if e.get("level") == "error"
+        "errors": sum((e.get("repeats", 1) if e["kind"] == "crash" else 1) for e in events if e.get("level") == "error"
                       and e["kind"] in ("message", "crash", "engine_load", "download", "connection", "mcp_start")),
+        "big_requests": _med(e.get("request", {}).get("request_chars") for e in events if e["kind"] == "turn"
+                             and "127.0.0.1" not in str(e.get("request", {}).get("host", ""))),
         "slow": sum(1 for e in events if e.get("level") == "slow"), "models": models,
         "engine_read_tps": _med(r.get("engine_prompt_tps") for r in local),
         "engine_cache_share": (round(100 * sum(r.get("engine_cache_n") or 0 for r in local) /
@@ -61,9 +64,12 @@ def summarize(events: list[dict]) -> dict:
 def advice(sm: dict) -> list[str]:
     tips = []
     for m in sm["models"]:
-        if m["first_words_s"] and m["first_words_s"] > 15:
+        if m["first_words_s"] and m["first_words_s"] > 15 and m.get("local", True):
             tips.append(f"{m['model']}: first words take about {m['first_words_s']} s. On a processor without a "
                         "graphics card, use a smaller model or Speed: Fast; for big jobs use a cloud model.")
+        elif m["first_words_s"] and m["first_words_s"] > 15:
+            tips.append(f"{m['model']}: first words take about {m['first_words_s']} s, mostly reading a very long "
+                        "chat. Start a New chat for a new task; 1.3 also sends less history per step.")
         if m["tokens_per_s"] and m["tokens_per_s"] < 6:
             tips.append(f"{m['model']}: writes about {m['tokens_per_s']} words/s. A smaller model or the graphics "
                         "card (Settings) will be faster.")
@@ -73,11 +79,16 @@ def advice(sm: dict) -> list[str]:
     if any(e.get("backend") == "cpu" for e in sm["loads"]) and any(e.get("backend") == "vulkan" and e.get("level") == "error"
                                                                   for e in sm["loads"]):
         tips.append("The graphics card failed to start, so the processor is used. Update the graphics driver.")
+    if sm.get("big_requests") and sm["big_requests"] > 100000:
+        tips.append(f"Each cloud step sent about {int(sm['big_requests']):,} characters (the whole chat). AFIF Coder "
+                    "1.3 sends only what fits each model; on older versions, start a New chat for new tasks.")
     errs = [e for e in sm["problems"] if e.get("level") == "error"]
     if any("credit" in str(e.get("error", "")).lower() for e in errs):
-        tips.append("Claude: the API account needs credit (platform.claude.com → Billing).")
+        tips.append("A paid provider (Claude or DeepSeek) is out of credit. Add credit on its website, or use "
+                    "Free Auto, which switches between free models.")
     if any("quota" in str(e.get("error", "")).lower() or "rate limit" in str(e.get("error", "")).lower() for e in errs):
-        tips.append("A cloud provider hit its rate limit or quota. Wait, or switch model.")
+        tips.append("A free cloud model hit its rate limit or quota. Connect two or three free services (Gemini, "
+                    "Groq, GitHub Models, Mistral) and pick Free Auto: it moves on to the next one by itself.")
     return tips
 
 

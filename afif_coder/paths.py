@@ -33,6 +33,11 @@ def models_dir() -> Path:
     return d
 
 
+def bundled_models_dir() -> Path:
+    """Light model shipped inside the installer (read-only, in the install folder)."""
+    return app_base() / "models"
+
+
 def total_ram_gb() -> float:
     try:
         if sys.platform == "win32":

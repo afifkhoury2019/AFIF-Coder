@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut, QTextOption
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QPlainTextEdit,
+    QFormLayout, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
     QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget, QTextBrowser, QVBoxLayout,
     QWidget,
 )
@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from . import __version__
 from .agent import Agent, extract_text_calls
 from .attachments import Attachment, build_message, from_image_bytes, load as load_attachment
-from .backends import PROVIDERS, BackendError, LocalBackend, make_backend, unprotect
+from .backends import PROVIDERS, BackendError, LocalBackend, RouterBackend, make_backend, unprotect
 from .connections import ConnectionsDialog, SkillsDialog
 from .report import ReportDialog
 from .engine import Engine
@@ -43,8 +43,8 @@ DEFAULTS = {
 
 def pretty_model(pid: str, model: str) -> str:
     """claude-sonnet-5-5 -> Claude Sonnet 5.5, gemini-3.8-flash -> Gemini 3.8 Flash."""
-    if pid == "custom":
-        return model
+    if pid not in ("anthropic", "gemini", "deepseek"):
+        return model.removesuffix(":free")
     words, out, i = model.split("-"), [], 0
     brand = {"claude": "Claude", "gemini": "Gemini", "deepseek": "DeepSeek"}
     while i < len(words):
@@ -701,34 +701,157 @@ class MainWindow(QMainWindow):
     def open_connections(self):
         dlg = ConnectionsDialog(self.s, self)
         dlg.open_project.connect(self.open_project)
+        dlg.claude_code.connect(self.start_claude_code)
         dlg.exec()
         save_settings(self.s)
         if self.s.get("project") and not self.busy:
             self.agent.messages[0]["content"] = self.agent.system_prompt()
 
+    # ---------- Claude Code on the AFIF Engine ----------
+    cc_line = Signal(str)
+    cc_done = Signal(bool, str)
+
+    def start_claude_code(self):
+        from . import claude_code as cc
+        from .engine import SPEED
+        if not self.s.get("project"):
+            QMessageBox.information(self, "Claude Code", "Open a project folder first; Claude Code works in it.")
+            return
+        if not self.sel.startswith("local:"):
+            QMessageBox.information(self, "Claude Code", "Pick a model on this PC at the top first. Claude Code "
+                                    "runs on it through the AFIF Engine (Qwen3 4B or bigger works best).")
+            return
+        if self.engine.current != "ready":
+            QMessageBox.information(self, "Claude Code", "Wait until the model has finished loading, then try again.")
+            return
+        if (self.engine.ctx_effective or 0) < cc.MIN_CONTEXT:
+            if QMessageBox.question(self, "Claude Code needs more memory", "Claude Code needs a context of at least "
+                                    f"{cc.MIN_CONTEXT:,} tokens (now {self.engine.ctx_effective:,}). Reload the model "
+                                    "with a 64K context? It uses more RAM.") != QMessageBox.Yes:
+                return
+            self.s["num_ctx"] = 65536
+            save_settings(self.s)
+            self._cc_after_load = True
+            self._load(self.sel[6:], force=True)
+            self.status.setText("Reloading the model with a larger context for Claude Code…")
+            return
+        mins = cc.first_reply_minutes(SPEED.get("prompt_tps") or 0)
+        if mins > 3 and QMessageBox.question(
+                self, "Claude Code will be slow here", f"On this PC the first answer will take about {mins:.0f} "
+                "minutes (Claude Code sends ~20,000 tokens of instructions; later answers are quicker because "
+                "they're cached). For quick work use AFIF Coder's own chat, which sends ~2,000. Start anyway?") \
+                != QMessageBox.Yes:
+            return
+        if cc.installed():
+            self._cc_launch()
+            return
+        self.status.setText("Downloading Claude Code from npm (first time only)…")
+        if not getattr(self, "_cc_wired", False):
+            self._cc_wired = True
+            self.cc_line.connect(lambda t: self.status.setText("Installing Claude Code: " + t[-120:]))
+            self.cc_done.connect(lambda ok, msg: self._cc_launch() if ok else
+                                 QMessageBox.warning(self, "Claude Code", msg))
+        threading.Thread(target=lambda: self.cc_done.emit(*cc.install(self.cc_line.emit)), daemon=True).start()
+
+    def _cc_launch(self):
+        from . import claude_code as cc
+        from . import diag
+        try:
+            cc.launch(self.s["project"], self.engine.url)
+            diag.event("claude_code", level="info", model=Path(self.engine.model).stem, context=self.engine.ctx_effective)
+            self.status.setText("Claude Code started in its own window, running free on this PC's model. Keep "
+                                "AFIF Coder open while you use it.")
+        except Exception as e:
+            diag.error("claude_code", e)
+            QMessageBox.warning(self, "Claude Code", str(e))
+
     # ---------- models ----------
-    def _cloud_choices(self) -> list[tuple[str, str]]:
+    def _connected(self, pid: str) -> bool:
+        p = PROVIDERS.get(pid)
+        cfg = (self.s.get("cloud") or {}).get(pid) or {}
+        if not p:
+            return False
+        if p.keyless:
+            return bool(self.s.get("github_user")) and cfg.get("enabled", True)
+        return bool(cfg.get("key") or (p.custom and cfg.get("base_url")))
+
+    def _models_of(self, pid: str) -> list[str]:
+        p = PROVIDERS[pid]
+        cfg = (self.s.get("cloud") or {}).get(pid) or {}
+        if p.custom and cfg.get("pinned"):
+            return [n.strip() for n in cfg["pinned"].split(",") if n.strip()]
+        names = cfg.get("models") or list(p.defaults)
+        if pid == "gemini":                    # hide special models saved by older versions
+            from .backends import gemini_chat_model, gemini_rank
+            names = sorted([n for n in names if gemini_chat_model(n)], key=gemini_rank) or list(p.defaults)
+        from .backends import chat_model
+        return [n for n in names if chat_model(n)] or list(p.defaults)
+
+    def _cloud_choices(self) -> list[tuple[str, str, bool]]:
         out = []
-        for pid, cfg in (self.s.get("cloud") or {}).items():
-            p = PROVIDERS.get(pid)
-            if not p or not (cfg.get("key") or (p.custom and cfg.get("base_url"))):
+        for pid in PROVIDERS:
+            if not self._connected(pid):
                 continue
-            if p.custom and cfg.get("pinned"):
-                names = [n.strip() for n in cfg["pinned"].split(",") if n.strip()]
-            else:
-                names = cfg.get("models") or list(p.defaults)
-            if pid == "gemini":                    # hide special models saved by older versions
-                from .backends import gemini_chat_model, gemini_rank
-                names = sorted([n for n in names if gemini_chat_model(n)], key=gemini_rank) or list(p.defaults)
-            for m in names[:60]:
-                out.append((f"{pretty_model(pid, m)}  ·  {p.label if not p.custom else 'cloud'}", f"cloud:{pid}:{m}"))
+            p = PROVIDERS[pid]
+            for m in self._models_of(pid)[:60]:
+                out.append((f"{pretty_model(pid, m)}  ·  {p.label if not p.custom else 'cloud'}", f"cloud:{pid}:{m}",
+                            p.free))
         return out
+
+    # Free Auto: which model of each free service to use, best first
+    FREE_PICKS = {
+        "gemini": lambda ids: [i for i in ids if "flash" in i and "lite" not in i][:2] + [i for i in ids if "lite" in i][:1],
+        "groq": lambda ids: [i for i in ("openai/gpt-oss-120b", "moonshotai/kimi-k2-instruct", "qwen/qwen3-32b",
+                                         "llama-3.3-70b-versatile") if i in ids][:2] or ids[:1],
+        "cerebras": lambda ids: [i for i in ids if "coder" in i or "gpt-oss" in i][:2] or ids[:1],
+        "mistral": lambda ids: [i for i in ids if "devstral" in i][:1] + [i for i in ids if "medium" in i][:1] or ids[:1],
+        "github": lambda ids: [i for i in ("openai/gpt-4.1", "openai/gpt-4.1-mini", "openai/gpt-4o") if i in ids][:2]
+        or ids[:1],
+        "openrouter": lambda ids: sorted(ids, key=lambda i: (not any(k in i for k in ("coder", "gpt-oss", "deepseek",
+                                                                                         "qwen3", "kimi"))))[:3],
+    }
+
+    def _free_candidates(self) -> list:
+        cands = []
+        for pid in ("gemini", "groq", "cerebras", "mistral", "github", "openrouter"):
+            if not self._connected(pid):
+                continue
+            for m in self.FREE_PICKS[pid](self._models_of(pid)):
+                def factory(pid=pid, m=m):
+                    cfg = dict((self.s.get("cloud") or {}).get(pid) or {})
+                    cfg["key"] = unprotect(cfg.get("key", ""))
+                    return make_backend(pid, m, cfg)
+                cands.append((f"{pretty_model(pid, m)} ({PROVIDERS[pid].label})", factory))
+        local = self._best_local()
+        if local:
+            cands.append((f"{display_name(local)} (this PC)", lambda: self._local_on_demand(local)))
+        return cands
+
+    def _best_local(self):
+        paths = installed_models(self.s["extra_models"])
+        if self.engine.model and Path(self.engine.model).is_file():
+            return Path(self.engine.model)
+        return min(paths, key=lambda p: p.stat().st_size) if paths else None
+
+    def _local_on_demand(self, path):
+        """Free Auto's last resort: load a model on this PC (runs on the agent's thread)."""
+        if not (self.engine.current == "ready" and Path(self.engine.model) == Path(path)):
+            self.engine.start(str(path), int(self.s["num_ctx"]), bool(self.s["use_gpu"]))
+            self.engine.model = str(path)
+            t0 = time.time()
+            while self.engine.current != "ready" and time.time() - t0 < 300:
+                if self.engine.current == "failed":
+                    raise BackendError("The model on this PC couldn't be loaded.")
+                time.sleep(0.3)
+            if self.engine.current != "ready":
+                raise BackendError("The model on this PC took too long to load.")
+        return LocalBackend(self.engine.url, self.engine.ctx_effective or int(self.s.get("num_ctx", 16384)))
 
     def refresh_models(self, start: bool = False):
         paths = installed_models(self.s["extra_models"])
         clouds = self._cloud_choices()
         want = self.s.get("model", "")
-        if want and not want.startswith(("local:", "cloud:")):
+        if want and not want.startswith(("local:", "cloud:", "auto:")):
             want = "local:" + want                       # settings from 1.0
         self.model.blockSignals(True)
         self.model.clear()
@@ -737,13 +860,22 @@ class MainWindow(QMainWindow):
             self.model.addItem(text, None)
             self.model.model().item(self.model.count() - 1).setEnabled(False)
 
+        free = [c for c in clouds if c[2]]
+        paid = [c for c in clouds if not c[2]]
+        if free:
+            header("Free Auto: switches between your free models")
+            self.model.addItem("   Free Auto (recommended)", "auto:free")
         if paths:
             header("On this PC: free, offline")
             for p in paths:
                 self.model.addItem("   " + display_name(p), "local:" + str(p))
-        if clouds:
+        if free:
+            header("Free cloud: daily limits")
+            for label, data, _ in free:
+                self.model.addItem("   " + label, data)
+        if paid:
             header("Cloud: billed to your API key")
-            for label, data in clouds:
+            for label, data, _ in paid:
                 self.model.addItem("   " + label, data)
         self.model.addItem(MANAGE, "manage")
         choices = [self.model.itemData(i) for i in range(self.model.count())]
@@ -783,10 +915,17 @@ class MainWindow(QMainWindow):
             return
         self.sel = data
         self.engine.stop()                     # free the PC's memory while using the cloud
+        if data == "auto:free":
+            names = [n for n, _ in self._free_candidates()]
+            self._set_dot("true", "Free Auto", "Uses, in order: " + ", ".join(names))
+            self.status.setText("Free Auto: uses your free models one after another and switches when one is "
+                                "busy or out of quota. First choice: " + (names[0] if names else "none"))
+            return
         _, pid, model = data.split(":", 2)
         p = PROVIDERS[pid]
         self._set_dot("true", "Cloud", f"{pretty_model(pid, model)} via {p.label}. {p.note}")
-        self.status.setText(f"Using {pretty_model(pid, model)} in the cloud. Messages are billed to your {p.label} key.")
+        self.status.setText(f"Using {pretty_model(pid, model)} in the cloud. " + (
+            f"{p.label} free tier: {p.note}" if p.free else f"Messages are billed to your {p.label} key."))
 
     def _load(self, path: str, force: bool = False):
         if not force and self.engine.model == path and self.engine.current in ("loading", "ready"):
@@ -803,7 +942,7 @@ class MainWindow(QMainWindow):
         self.dot.setToolTip(tip)
 
     def _on_engine(self, state: str, detail: str):
-        if self.sel.startswith("cloud:"):
+        if self.sel.startswith(("cloud:", "auto:")):
             return                             # the engine is idle while a cloud model is chosen
         colours = {"ready": "true", "loading": "wait", "failed": "false", "off": "false"}
         where = " (GPU)" if detail.endswith("on GPU") else (" (CPU)" if detail.endswith("on CPU") else "")
@@ -813,7 +952,10 @@ class MainWindow(QMainWindow):
         if state == "failed":
             self.engine.model = ""
             self.status.setText(detail)
-        elif state == "ready":
+        elif state == "ready" and getattr(self, "_cc_after_load", False):
+            self._cc_after_load = False
+            QTimer.singleShot(200, self.start_claude_code)
+        if state == "ready":
             self.status.setText(f"Model ready: {detail}" + (
                 ". It's running on the processor, so replies are slower than on a graphics card; "
                 "the Fast speed and smaller models help." if detail.endswith("on CPU") else ""))
@@ -824,6 +966,11 @@ class MainWindow(QMainWindow):
     def _backend(self):
         """Called by the agent (worker thread) at the start of each message."""
         sel = self.sel
+        if sel == "auto:free":
+            cands = self._free_candidates()
+            if not cands:
+                raise BackendError("Connect a free service in Models → Cloud first (Gemini, Groq, GitHub…).")
+            return RouterBackend(cands)
         if sel.startswith("cloud:"):
             _, pid, model = sel.split(":", 2)
             cfg = dict((self.s.get("cloud") or {}).get(pid) or {})
@@ -831,7 +978,7 @@ class MainWindow(QMainWindow):
             return make_backend(pid, model, cfg)
         if self.engine.current != "ready":
             raise BackendError("The local model isn't loaded yet.")
-        return LocalBackend(self.engine.url, int(self.s.get("num_ctx", 16384)))
+        return LocalBackend(self.engine.url, self.engine.ctx_effective or int(self.s.get("num_ctx", 16384)))
 
     def _sees_images(self) -> bool:
         if not self.sel.startswith("cloud:"):
@@ -993,7 +1140,7 @@ class MainWindow(QMainWindow):
         if self.busy or not self.sel.startswith("local:") or self.engine.current != "ready" \
                 or not self.s.get("project") or self.agent.toolbox is None:
             return
-        backend = LocalBackend(self.engine.url, int(self.s.get("num_ctx", 16384)))
+        backend = LocalBackend(self.engine.url, self.engine.ctx_effective or int(self.s.get("num_ctx", 16384)))
         threading.Thread(target=self.agent.warm_up, args=(backend,), daemon=True).start()
 
     def _on_delta(self, text: str):

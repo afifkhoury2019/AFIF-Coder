@@ -573,6 +573,196 @@ import zipfile as _zf  # noqa: E402
 names = _zf.ZipFile(z).namelist()
 check({"report.html", "events.jsonl"} <= set(names), f"export makes one zip ({names})")
 
+
+print("1.3: large downloads don't crash the window")
+from PySide6.QtCore import QObject as _QO, Signal as _Sig  # noqa: E402
+from afif_coder.models import Downloader  # noqa: E402
+dl = Downloader()
+got = []
+dl.progress.connect(lambda mid, d, t, sp: got.append((d, t)))
+threading.Thread(target=lambda: dl.progress.emit("m", 5_000_000_000, 6_000_000_000, 1e6)).start()
+t0 = time.time()
+while not got and time.time() - t0 < 3:
+    app.processEvents(); time.sleep(0.02)
+check(got == [(5_000_000_000, 6_000_000_000)], f"progress above 2 GB arrives intact ({got})")
+os.environ["AFIF_DATA"] = tempfile.mkdtemp()
+from afif_coder import diag as _diag  # noqa: E402
+for _ in range(50):
+    try:
+        raise OverflowError()
+    except OverflowError as e:
+        _diag.error("crash", e, where="main")
+crashes = [e for e in _diag.read_events() if e["kind"] == "crash"]
+check(len(crashes) == 1, f"a repeating crash is logged once, then counted ({len(crashes)} entries)")
+
+print("1.3: Stop works while a cloud model is still connecting")
+class SlowHeaders(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        time.sleep(6)
+        try:
+            self.send_response(200); self.end_headers()
+        except OSError:
+            pass
+sh = serve(SlowHeaders, "slowheaders")
+sb = backends.make_backend("gemini", "gemini-3.8-flash", {"key": "g", "base_url": sh})
+res = {}
+stop_at = time.time() + 0.6
+t0 = time.time()
+r = sb.stream([{"role": "user", "content": "hi"}], [], 0.2, lambda t: None, lambda: time.time() > stop_at)
+check(r is None and time.time() - t0 < 1.5, f"Stop before the first byte returns at once ({time.time() - t0:.2f}s)")
+
+print("1.3: busy services are retried, used-up quotas are not")
+CALLS = {"n": 0}
+class Busy(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        CALLS["n"] += 1
+        if CALLS["n"] == 1:
+            self.send_response(503); self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(json.dumps([{"error": {"code": 503, "message": "high demand",
+                                                     "details": [{"retryDelay": "1s"}]}}]).encode())
+            return
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        sse(self, {"choices": [{"index": 0, "delta": {"content": "ok"}}]})
+        self.wfile.write(b"data: [DONE]\n\n")
+bu = serve(Busy, "busy")
+bb = backends.make_backend("gemini", "gemini-3.8-flash", {"key": "g", "base_url": bu})
+turn = bb.stream([{"role": "user", "content": "hi"}], [], 0.2, lambda t: None, lambda: False)
+check(turn and turn.msg["content"] == "ok" and CALLS["n"] == 2, f"503 'high demand' retried after its delay ({bb.timing.get('retries')})")
+class Daily(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(429); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(json.dumps({"error": {"message": "Quota exceeded: requests per day"}}).encode())
+dd = serve(Daily, "daily")
+db = backends.make_backend("groq", "openai/gpt-oss-120b", {"key": "k", "base_url": dd})
+t0 = time.time()
+try:
+    db.stream([{"role": "user", "content": "hi"}], [], 0.2, lambda t: None, lambda: False); e = ""
+except backends.BackendError as ex:
+    e = str(ex)
+check("quota" in e and time.time() - t0 < 2, f"a daily quota fails at once, no pointless waiting ({time.time() - t0:.1f}s)")
+
+print("1.3: Gemini's special models are hidden")
+for mid in ("gemini-3.5-transcribe", "gemini-3.5-flash-preview-tts", "gemini-2.5-computer-use-preview"):
+    check(not backends.gemini_chat_model(mid), f"hidden: {mid}")
+check(backends.gemini_chat_model("gemini-3.8-flash"), "kept: gemini-3.8-flash")
+
+print("1.3: each turn sends only what fits (tokens and time)")
+ag = Agent({}, None); ag.reset(str(project()))
+ag.messages.append({"role": "user", "content": "build the weather app"})
+for i in range(60):
+    ag.messages.append({"role": "assistant", "content": "", "tool_calls": [
+        {"id": f"c{i}", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": f"f{i}.kt"})}}]})
+    ag.messages.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 3000})
+ag.messages.append({"role": "user", "content": "proceed the efforts"})
+full_len = len(ag.messages)
+before = json.dumps(ag.messages)
+msgs, tools = ag._payload(24000, False)
+est = sum(Agent._tokens(m) for m in msgs) + len(json.dumps(tools)) / 3.5
+check(est <= 24000, f"Gemini turn fits its 24K budget (~{est:.0f} tokens; the whole chat is ~{sum(Agent._tokens(m) for m in ag.messages):.0f})")
+check(json.dumps(ag.messages) == before and len(ag.messages) == full_len, "the saved chat itself is untouched")
+ids = set()
+ok_pairs = True
+for m in msgs:
+    for c in m.get("tool_calls") or []:
+        ids.add(c["id"])
+    if m["role"] == "tool" and m["tool_call_id"] not in ids:
+        ok_pairs = False
+check(ok_pairs, "every tool result still follows the call it answers")
+check(msgs[-1]["content"] == "proceed the efforts", "the newest message is always sent")
+small, _ = ag._payload(6000, True)
+check(sum(Agent._tokens(m) for m in small) < 6000 and "left out" in json.dumps(small),
+      f"a 6K free tier (Groq, GitHub) gets the short prompt and a note about left-out history ({len(small)} msgs)")
+msgs2, _ = ag._payload(24000, False)
+check([m.get("content") for m in msgs2[1:]] == [m.get("content") for m in msgs[1:]], "the cut point is stable between turns (prompt cache stays valid)")
+from afif_coder.engine import SPEED  # noqa: E402
+lb = backends.LocalBackend("http://127.0.0.1:1", 32768)
+SPEED["prompt_tps"] = 31.0
+check(lb.budget_tokens == 4000, f"slow PC (31 tokens/s): about 4,000 tokens of chat ({lb.budget_tokens})")
+SPEED["prompt_tps"] = 900.0
+check(lb.budget_tokens == int(32768 * 0.6), f"fast GPU: up to 60% of the context ({lb.budget_tokens})")
+SPEED["prompt_tps"] = 0.0
+
+print("1.3: Free Auto switches when a free model is out of quota")
+class Ok(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        SEEN[self.server.name] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        sse(self, {"choices": [{"index": 0, "delta": {"content": "done by groq"}}]})
+        self.wfile.write(b"data: [DONE]\n\n")
+okurl = serve(Ok, "groqok")
+backends.COOLDOWN.clear()
+cands = [("Gemini Flash", lambda: backends.make_backend("gemini", "gemini-3.8-flash", {"key": "g", "base_url": dd})),
+         ("Groq", lambda: backends.make_backend("groq", "openai/gpt-oss-120b", {"key": "k", "base_url": okurl}))]
+rb = backends.RouterBackend(cands)
+out, ag2 = run_agent(rb, str(project()), "hi")
+check(not out.get("err") and "".join(out["text"]) == "done by groq", f"answered by the next free model ({out.get('err')})")
+check(backends.COOLDOWN.get("Gemini Flash", 0) > time.time() + 600, "the used-up one rests (daily quota: an hour)")
+check(len(json.dumps(SEEN["groqok"])) < 40000 and SEEN["groqok"]["max_tokens"] == 2048,
+      f"Groq gets a prompt sized for its free limit ({len(json.dumps(SEEN['groqok']))} chars)")
+out, _ = run_agent(backends.RouterBackend(cands), str(project()), "hi again")
+check("done by groq" in "".join(out["text"]), "next message goes straight to the one that works")
+
+print("1.3: tool calls fit each service")
+hist = [{"role": "user", "content": "x"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_7_0", "type": "function",
+         "function": {"name": "read_file", "arguments": "{}"}, "extra_content": {"google": {"thought_signature": "S"}}}]},
+        {"role": "tool", "tool_call_id": "call_7_0", "content": "y"}]
+gq = backends.make_backend("groq", "m", {"key": "k"})._prepare(hist)
+check("extra_content" not in gq[1]["tool_calls"][0], "Gemini's signature isn't sent to Groq")
+ms = backends.make_backend("mistral", "m", {"key": "k"})._prepare(hist)
+check(len(ms[1]["tool_calls"][0]["id"]) == 9 and ms[1]["tool_calls"][0]["id"] == ms[2]["tool_call_id"],
+      "Mistral gets 9-character call ids, matched in the results")
+hist[1]["tool_calls"][0].pop("extra_content")
+gm = backends.make_backend("gemini", "m", {"key": "k"})._prepare(hist)
+check(gm[1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"], "Gemini gets a signature on calls made by other models")
+
+print("1.3: free providers")
+class Lists(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200); self.end_headers()
+        self.wfile.write(json.dumps({"data": [
+            {"id": "qwen/qwen3-coder:free", "supported_parameters": ["tools", "temperature"]},
+            {"id": "meta/llama:free", "supported_parameters": ["temperature"]},
+            {"id": "openai/gpt-5", "supported_parameters": ["tools"]},
+            {"id": "whisper-large-v3"}, {"id": "llama-3.3-70b-versatile"}]}).encode())
+lu = serve(Lists, "lists")
+orm = backends.list_models("openrouter", {"key": "k", "base_url": lu})
+check(orm == ["qwen/qwen3-coder:free"], f"OpenRouter: only free models that can use tools ({orm})")
+gqm = backends.list_models("groq", {"key": "k", "base_url": lu})
+check("whisper-large-v3" not in gqm and "llama-3.3-70b-versatile" in gqm, "Groq: speech models hidden")
+check(backends.PROVIDERS["github"].keyless and backends.PROVIDERS["github"].free, "GitHub Models uses the GitHub sign-in")
+try:
+    backends.github_token = lambda: ""
+    backends.make_backend("github", "openai/gpt-4.1", {}); e = ""
+except backends.BackendError as ex:
+    e = str(ex)
+check("Sign in to GitHub" in e, "GitHub Models without a sign-in says what to do")
+
+print("1.3: built-in light model and Claude Code")
+from afif_coder import models as mdl, paths as pth, claude_code  # noqa: E402
+bdir = Path(tempfile.mkdtemp())
+(bdir / "Qwen3-1.7B-Q4_K_M.gguf").write_bytes(b"GGUF")
+pth_old = mdl.bundled_models_dir
+mdl.bundled_models_dir = lambda: bdir
+found = mdl.installed_models([])
+mdl.bundled_models_dir = pth_old
+check(found and found[0].name == "Qwen3-1.7B-Q4_K_M.gguf", "the built-in model is listed first")
+check(mdl.display_name(found[0]) == "Qwen3 1.7B (AFIF Lite)", "and named AFIF Lite")
+light = [m for m in mdl.CATALOG if m["size"] <= 2.5]
+check(len(light) >= 8, f"{len(light)} light models (2.5 GB or less) in the catalog")
+env = claude_code.environment("http://127.0.0.1:5555")
+check(env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:5555" and env["ANTHROPIC_MODEL"] == "afif-local"
+      and env["ANTHROPIC_AUTH_TOKEN"] and "ANTHROPIC_API_KEY" not in env, "Claude Code is pointed at the AFIF Engine, no Anthropic key")
+check(abs(claude_code.first_reply_minutes(100) - 3.33) < 0.1, "first-reply estimate shown before starting")
+
 print("Key storage")
 enc = backends.protect("sk-secret-123")
 check(enc and "sk-secret" not in enc and backends.unprotect(enc) == "sk-secret-123",

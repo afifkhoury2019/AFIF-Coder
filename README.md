@@ -8,27 +8,52 @@ It works inside one project folder and can list, read, search, create and edit f
 
 1. Download **AFIF-Coder-Setup-x.y.z.exe** from the [Releases](../../releases) page.
 2. Run it. It installs for your user without admin rights (or choose "all users").
-3. On first start, the **Models** window opens. Download the model it recommends for your PC. This happens once; after that AFIF Coder works offline.
+3. It works straight away: a light model, **Qwen3 1.7B (AFIF Lite)**, is built into the installer. For more power, download a bigger model in **Models**, or use free cloud models with **Free Auto** (below).
 
 | Your PC | Model |
 |---|---|
-| 8 GB RAM | Qwen2.5 Coder 3B (1.8 GB) |
+| Any PC, 2-core laptop | Qwen3 1.7B (built in), Qwen3 0.6B, Llama 3.2 1B, Gemma 3 1B |
+| 8 GB RAM | Qwen3 4B Instruct (2.5 GB), Llama 3.2 3B, Granite 4.0 Micro |
 | 16 GB RAM, or a 6–8 GB graphics card | Qwen2.5 Coder 7B (4.4 GB) |
 | 24 GB+ RAM or a 12–16 GB graphics card | Qwen2.5 Coder 14B (8.4 GB) |
 | 32 GB+ RAM | Qwen3 Coder 30B-A3B (17.3 GB) |
 
 The **On this PC** tab also offers Llama 3.1, Qwen3, DeepSeek R1 and DeepSeek Coder V2 Lite, Google's Gemma 3, OpenAI's gpt-oss 20B and Mistral's Devstral. You can add any `.gguf` file you have, or paste a Hugging Face link to download one.
 
-## Cloud models (Claude, Gemini, DeepSeek)
+## Free cloud models and Free Auto
 
-Open **Manage models… → Cloud**, paste your API key and click **Save and connect**. The provider's models then appear in the model list under "Cloud".
+Open **Manage models… → Cloud**. The services marked **FREE** cost nothing; each has daily or per-minute limits.
+Connect two or three, then pick **Free Auto** at the top of the model list: it uses them one after another and
+moves on by itself when one is busy or out of quota (the idea behind FreeLLMAPI, built in).
+
+| Service | How | Limits |
+|---|---|---|
+| GitHub Models | Nothing to paste: uses your GitHub sign-in (Connections) | Daily limits, ~8,000 tokens per request |
+| Gemini (Google) | Key from aistudio.google.com/apikey | Free tier, daily limits |
+| Groq | Key from console.groq.com/keys | Very fast; small per-minute limits |
+| Mistral | Key from console.mistral.ai (free Experiment plan) | Rate limits |
+| OpenRouter | Key from openrouter.ai/keys; only `:free` models are listed | About 50 requests a day |
+| Cerebras | Key from cloud.cerebras.ai | Free or trial, depending on the account |
+
+Each step sends only as much of the chat as the model's limit allows (the full chat stays saved), so free
+quotas last much longer and replies start sooner.
+
+## Paid cloud models (Claude, DeepSeek)
 
 | Provider | Get a key | Cost |
 |---|---|---|
 | Claude (Anthropic) | platform.claude.com | Billed per use, separate from a Claude.ai subscription |
-| Gemini (Google) | aistudio.google.com/apikey | Free tier with daily limits |
 | DeepSeek | platform.deepseek.com | Billed per use, low prices |
-| Other | OpenRouter, OpenAI, Groq, Mistral, LM Studio… | Depends on the service |
+| Other | OpenAI, LM Studio, any OpenAI-compatible service | Depends on the service |
+
+## Claude Code, free on this PC
+
+**Connections → Claude Code, free on this PC → Start Claude Code** runs Anthropic's real Claude Code agent
+in its own window on the model loaded in the AFIF Engine, with no Anthropic account and no bill (the same idea
+as `ollama launch claude`, with nothing else to install). Claude Code is downloaded from npm the first time.
+It needs a 32K+ context (AFIF Coder offers to reload the model with 64K) and sends ~20,000 tokens of
+instructions before its first answer, so on a laptop processor that first answer takes minutes; use Qwen3 4B
+or bigger, ideally on a graphics card. AFIF Coder's own chat sends about 2,000.
 
 With a cloud model, your messages, attachments and the files the model reads are sent to that provider. The status bar shows the tokens each message used. Keys are stored encrypted for your Windows account.
 
@@ -40,7 +65,7 @@ Click **Attach files**, drag files onto the window, or paste an image. Text and 
 
 ## Building and cloning apps (skills, GitHub, Drive, REA)
 
-AFIF Coder 1.2 can follow the **AFIF-TECH App Rebuild playbook** end to end with any model:
+AFIF Coder can follow the **AFIF-TECH App Rebuild playbook** end to end with any model:
 
 - **Skills** (header → Skills): built-in skills for the App Rebuild playbook, REA reverse engineering,
   Word, Excel, PowerPoint, PDF and headless UI checks. A skill loads automatically when your message
@@ -83,7 +108,7 @@ AFIF Coder 1.2 can follow the **AFIF-TECH App Rebuild playbook** end to end with
   the chat has a **Details** link to it. **Export report…** saves one zip to send when something is slow
   or fails. API keys and sign-in tokens are never recorded. Logs are kept 14 days.
 
-The engine uses your graphics card through Vulkan (NVIDIA, AMD and Intel) and falls back to the CPU automatically if that doesn't work.
+The engine uses your graphics card through Vulkan (NVIDIA, AMD and Intel) and falls back to the CPU automatically if that doesn't work. With built-in graphics (shared memory, e.g. Intel HD), it measures the graphics chip against the processor once and keeps the faster. If a model doesn't fit in memory, it reloads with a smaller context automatically.
 
 ## Honest limits
 

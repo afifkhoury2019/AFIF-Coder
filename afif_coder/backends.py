@@ -54,6 +54,10 @@ class Provider:
     vision: bool = True
     echo_reasoning: bool = False
     custom: bool = False
+    free: bool = False      # has a free tier: listed under "Free cloud" and used by Free Auto
+    budget: int = 32000     # tokens of instructions + chat history to send per turn
+    max_tokens: int = 0     # cap on each reply (0 = the service's default)
+    keyless: bool = False   # works without a pasted key (GitHub Models uses the GitHub sign-in)
 
 
 PROVIDERS = {
@@ -61,17 +65,44 @@ PROVIDERS = {
         "anthropic", "Claude", "anthropic", "https://api.anthropic.com",
         "https://platform.claude.com/settings/keys",
         "Billed per use by Anthropic (separate from a Claude.ai subscription).",
-        ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1"]),
+        ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1"], budget=60000),
     "gemini": Provider(
         "gemini", "Gemini", "openai", "https://generativelanguage.googleapis.com/v1beta/openai",
         "https://aistudio.google.com/apikey",
         "Google AI Studio keys include a free tier with daily limits.",
-        ["gemini-3.8-flash"]),
+        ["gemini-3.8-flash"], free=True, budget=24000),
     "deepseek": Provider(
         "deepseek", "DeepSeek", "openai", "https://api.deepseek.com",
         "https://platform.deepseek.com/api_keys",
         "Billed per use by DeepSeek; low prices.",
-        ["deepseek-flash", "deepseek-v4-pro"], vision=False, echo_reasoning=True),
+        ["deepseek-flash", "deepseek-v4-pro"], vision=False, echo_reasoning=True, budget=32000),
+    "groq": Provider(
+        "groq", "Groq", "openai", "https://api.groq.com/openai/v1",
+        "https://console.groq.com/keys",
+        "Free tier, very fast. Small per-minute limits, so AFIF Coder sends a short prompt.",
+        ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "qwen/qwen3-32b"],
+        vision=False, free=True, budget=5500, max_tokens=2048),
+    "cerebras": Provider(
+        "cerebras", "Cerebras", "openai", "https://api.cerebras.ai/v1",
+        "https://cloud.cerebras.ai",
+        "Free or trial credits depending on the account; very fast.",
+        ["gpt-oss-120b", "qwen-3-coder-480b"], vision=False, free=True, budget=7000, max_tokens=2048),
+    "mistral": Provider(
+        "mistral", "Mistral", "openai", "https://api.mistral.ai/v1",
+        "https://console.mistral.ai/api-keys",
+        "Free 'Experiment' plan (phone check) with rate limits. Devstral and Codestral are built for code.",
+        ["devstral-latest", "mistral-medium-latest", "codestral-latest"], vision=False, free=True, budget=20000),
+    "openrouter": Provider(
+        "openrouter", "OpenRouter", "openai", "https://openrouter.ai/api/v1",
+        "https://openrouter.ai/keys",
+        "Models ending in \":free\" cost nothing (about 50 requests a day without credit).",
+        [], vision=False, free=True, budget=16000, max_tokens=4096),
+    "github": Provider(
+        "github", "GitHub Models", "openai", "https://models.github.ai/inference",
+        "",
+        "Free with your GitHub sign-in (Connections). Daily limits; about 8,000 tokens per request.",
+        ["openai/gpt-4.1", "openai/gpt-4.1-mini", "deepseek/deepseek-v3-0324"],
+        vision=False, free=True, budget=6500, max_tokens=3000, keyless=True),
     "custom": Provider(
         "custom", "Other", "openai", "",
         "",
@@ -80,9 +111,24 @@ PROVIDERS = {
 }
 
 
+def github_token() -> str:
+    """The token of the GitHub sign-in (Connections), used for GitHub Models."""
+    try:
+        from . import tooling
+        code, out = tooling.run(["gh", "auth", "token"], timeout=15)
+        tok = out.strip().splitlines()[-1].strip() if code == 0 and out.strip() else ""
+        return tok if tok.startswith(("gho_", "ghp_", "ghu_", "github_pat_")) else ""
+    except Exception:
+        return ""
+
+
 def make_backend(provider_id: str, model: str, cfg: dict) -> "Backend":
     p = PROVIDERS[provider_id]
     key = cfg.get("key", "")
+    if not key and p.keyless:
+        key = github_token()
+        if not key:
+            raise BackendError("Sign in to GitHub in Connections first; GitHub Models uses that sign-in.")
     if not key and provider_id != "custom":
         raise BackendError(f"Add your {p.label} API key in Models → Cloud first.")
     if p.kind == "anthropic":
@@ -92,27 +138,49 @@ def make_backend(provider_id: str, model: str, cfg: dict) -> "Backend":
         raise BackendError("Set the address of your OpenAI-compatible service in Models → Cloud.")
     b = OpenAIBackend(base, key, model, vision=cfg.get("vision", p.vision), echo_reasoning=p.echo_reasoning,
                       label=p.label)
+    b.provider = provider_id
     b.effort_ok = provider_id == "gemini"          # Gemini accepts reasoning_effort
+    b.budget_tokens = int(cfg.get("budget") or p.budget)
+    if p.max_tokens:
+        b.max_tokens = p.max_tokens
+    if provider_id == "github":
+        b.extra_headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     return b
 
 
 def list_models(provider_id: str, cfg: dict) -> list[str]:
     """Ask the provider which models this key can use. Raises BackendError with a readable reason."""
     p = PROVIDERS[provider_id]
-    key = cfg.get("key", "")
+    key = cfg.get("key", "") or (github_token() if p.keyless else "")
+    if p.keyless and not key:
+        raise BackendError("Sign in to GitHub in Connections first.")
     try:
         if p.kind == "anthropic":
             r = HTTP.get(f"{p.base_url}/v1/models?limit=100", timeout=20,
                              headers={"x-api-key": key, "anthropic-version": "2023-06-01"})
             _raise_for(r, p.label)
             return [m["id"] for m in r.json().get("data", [])]
+        if provider_id == "github":
+            r = HTTP.get("https://models.github.ai/catalog/models", timeout=20,
+                         headers={"Authorization": f"Bearer {key}", "Accept": "application/vnd.github+json"})
+            _raise_for(r, p.label)
+            data = r.json() if isinstance(r.json(), list) else r.json().get("data", [])
+            ids = [m.get("id", "") for m in data if "tool-calling" in (m.get("capabilities") or [])]
+            return sorted(i for i in ids if i)
         base = (cfg.get("base_url") or p.base_url).rstrip("/")
         r = HTTP.get(f"{base}/models", timeout=20, headers={"Authorization": f"Bearer {key}"} if key else {})
         _raise_for(r, p.label)
-        ids = [m.get("id", "").removeprefix("models/") for m in r.json().get("data", [])]
+        data = r.json()
+        data = data.get("data", []) if isinstance(data, dict) else data
+        if provider_id == "openrouter":       # free models that can use tools
+            return sorted(m["id"] for m in data if m.get("id", "").endswith(":free")
+                          and "tools" in (m.get("supported_parameters") or []))
+        ids = [m.get("id", "").removeprefix("models/") for m in data]
         if provider_id == "gemini":     # keep chat models that can use tools
             ids = [i for i in ids if gemini_chat_model(i)]
             return sorted(ids, key=gemini_rank)
+        if provider_id in ("groq", "cerebras", "mistral"):
+            ids = [i for i in ids if chat_model(i)]
         return sorted(i for i in ids if i)
     except requests.ConnectionError:
         raise BackendError(f"Can't reach {p.label}. Check your internet connection.")
@@ -128,7 +196,17 @@ def _unwrap(j):
 
 
 GEMINI_SKIP = ("embedding", "image", "tts", "imagen", "veo", "aqa", "audio", "live", "robotics", "learnlm",
-               "computer-use", "computer_use", "banana", "native", "exp-", "gemma", "lyria", "vision")
+               "computer-use", "computer_use", "banana", "native", "exp-", "gemma", "lyria", "vision",
+               "transcribe", "translat", "speech", "music", "deep-research", "diffusion")
+
+
+NON_CHAT = ("whisper", "tts", "guard", "embed", "moderation", "ocr", "playai", "orpheus", "allam", "voxtral",
+            "pixtral", "saba", "transcribe")
+
+
+def chat_model(model_id: str) -> bool:
+    """Speech, safety and embedding models in a provider's list can't chat with tools."""
+    return not any(k in model_id.lower() for k in NON_CHAT)
 
 
 def gemini_chat_model(model_id: str) -> bool:
@@ -160,6 +238,8 @@ def _raise_for(r, label: str):
     low = str(msg).lower()
     if r.status_code in (401, 403) or "api key" in low or "authentication" in low:
         raise BackendError(f"{label} rejected the API key. Check it in Models → Cloud. ({msg})")
+    if r.status_code == 413 or "request too large" in low or "tokens per minute" in low and "requested" in low:
+        raise BackendError(f"{label}: the request is too large for its limit. ({msg})")
     if r.status_code == 429:
         raise BackendError(f"{label} rate limit or quota reached. Wait a little, or check your plan. ({msg})")
     if r.status_code == 402 or "credit balance" in low or "insufficient" in low and "balance" in low:
@@ -176,6 +256,58 @@ def _raise_for(r, label: str):
 
 # ---------------------------------------------------------------- helpers
 _END = object()
+
+
+class Stopped(Exception):
+    """The user pressed Stop while a request was still connecting."""
+
+
+def post(url, stopped, **kw):
+    """POST on a helper thread, checking for Stop every 0.2 s. A cloud model can take 30 s or more
+    before it sends the first byte; Stop must not wait for that (the report showed Stop pressed
+    seven times and the app restarted). An abandoned request is closed when it finally answers."""
+    box: dict = {}
+    done = threading.Event()
+
+    def worker():
+        try:
+            box["r"] = HTTP.post(url, **kw)
+        except Exception as e:
+            box["e"] = e
+        done.set()
+        if box.get("abandoned") and box.get("r") is not None:
+            box["r"].close()
+
+    threading.Thread(target=worker, daemon=True).start()
+    while not done.wait(0.2):
+        if stopped():
+            box["abandoned"] = True
+            raise Stopped()
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
+
+
+def retry_wait(resp) -> float:
+    """Seconds to wait before retrying a busy (5xx) or briefly rate-limited (429) service, or 0 when
+    waiting won't help (a daily quota is used up, or the wait would be long)."""
+    import re as _re
+    if resp.status_code not in (429, 500, 502, 503, 529):
+        return 0
+    text = (resp.text or "")[:4000].lower()
+    m = _re.search(r'retry(?:delay|[ _-]?after|\s+in)\W{0,4}(\d+(?:\.\d+)?)\s*s', text)
+    if m:
+        secs = float(m.group(1))
+        return secs if secs <= 45 else 0
+    if resp.status_code == 429 and any(w in text for w in ("per day", "perday", "daily", "requestsperday")):
+        return 0
+    try:
+        ra = float(resp.headers.get("Retry-After", 0))
+    except ValueError:
+        ra = 0
+    if ra > 45:
+        return 0
+    return max(ra, 3.0)
 
 
 def _pump(resp, stopped):
@@ -232,6 +364,12 @@ def _lines(resp):
         yield buf
 
 
+def _short_id(i: str) -> str:
+    """Mistral only accepts tool-call ids of 9 letters and digits."""
+    import hashlib
+    return i if len(i) == 9 and i.isalnum() else hashlib.md5(i.encode()).hexdigest()[:9]
+
+
 def _public(m: dict) -> dict:
     """Drop our private bookkeeping keys before sending a message to a server."""
     return {k: v for k, v in m.items() if not k.startswith("_")}
@@ -265,6 +403,8 @@ class Backend:
             self.on_thinking(text)
 
     on_progress = None          # callable(done, total): prompt-reading progress (local engine)
+    on_status = None            # callable(str): short status line ("busy, retrying…", "switched to…")
+    budget_tokens = 32000       # how much chat history to send each turn (see Agent._view)
 
     def close(self):
         try:
@@ -336,8 +476,23 @@ class OpenAIBackend(Backend):
                 pm["content"] = [{k: v for k, v in p.items() if not k.startswith("_")} for p in pm["content"]]
             if self.echo_reasoning and m.get("_reasoning") and m["role"] == "assistant":
                 pm["reasoning_content"] = m["_reasoning"]
+            if pm.get("tool_calls"):
+                pm["tool_calls"] = [self._call_for_server(c) for c in pm["tool_calls"]]
+            if m["role"] == "tool" and self.provider == "mistral":
+                pm["tool_call_id"] = _short_id(pm.get("tool_call_id", ""))
             out.append(pm)
         flush()
+        return out
+
+    def _call_for_server(self, c: dict) -> dict:
+        """One chat can move between services (Free Auto). Each gets tool calls in the form it accepts:
+        Gemini needs a thought signature on every call, Mistral 9-character ids, others no extra fields."""
+        out = {"id": c.get("id", ""), "type": "function", "function": c["function"]}
+        if self.provider == "gemini":
+            extra = c.get("extra_content") or {"google": {"thought_signature": "skip_thought_signature_validator"}}
+            out["extra_content"] = extra
+        elif self.provider == "mistral":
+            out["id"] = _short_id(out["id"])
         return out
 
     def stream(self, messages, tools, temperature, on_text, stopped) -> Turn | None:
@@ -349,21 +504,16 @@ class OpenAIBackend(Backend):
             body["temperature"] = temperature
         body.update(self.extra_body())
         headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
+        headers.update(self.extra_headers)
         url = f"{self.base}/chat/completions"
         t0 = time.perf_counter()
         self.timing = {"host": self.base.split("/")[2] if "//" in self.base else self.base, "retries": [],
                        "request_chars": len(json.dumps(body))}
-        self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
-        self.timing["headers_s"] = round(time.perf_counter() - t0, 3)
-        self.timing["status"] = self.resp.status_code
+        self.resp = self._send(url, body, headers, stopped, t0)
+        if self.resp is None:
+            return None
         content, reasoning, calls, usage, tps = [], [], {}, (0, 0), 0.0
         try:
-            for optional in ("stream_options", "reasoning_effort", "chat_template_kwargs"):
-                if self.resp.status_code == 400 and optional in body and optional in self.resp.text:
-                    self.resp.close()        # a server that doesn't know this option: retry without it
-                    body.pop(optional)
-                    self.timing["retries"].append(f"without {optional}")
-                    self.resp = HTTP.post(url, json=body, headers=headers, stream=True, timeout=(10, 900))
             self.timing["status"] = self.resp.status_code
             if self.resp.status_code != 200:
                 self.timing["error_body"] = self.resp.text[:800]
@@ -447,6 +597,42 @@ class OpenAIBackend(Backend):
 
     local = False
     effort_ok = False
+    provider = ""
+    extra_headers: dict = {}
+    max_waits = 2               # short waits on "busy" / per-minute limits; Free Auto switches instead
+
+    def _send(self, url, body, headers, stopped, t0):
+        """Send the request; drop options a server doesn't know, and wait out short busy spells."""
+        waits = 0
+        while True:
+            try:
+                r = post(url, stopped, json=body, headers=headers, stream=True, timeout=(10, 900))
+            except Stopped:
+                return None
+            except requests.ConnectionError:
+                raise BackendError(f"Can't reach {self.label}. Check your internet connection.")
+            self.timing["headers_s"] = round(time.perf_counter() - t0, 3)
+            if r.status_code == 400:
+                bad = next((o for o in ("stream_options", "reasoning_effort", "chat_template_kwargs", "return_progress")
+                            if o in body and o in r.text), None)
+                if bad:                       # a server that doesn't know this option: retry without it
+                    r.close()
+                    body.pop(bad)
+                    self.timing["retries"].append(f"without {bad}")
+                    continue
+            wait = retry_wait(r) if waits < self.max_waits else 0
+            if not wait:
+                return r
+            waits += 1
+            self.timing["retries"].append(f"waited {wait:.0f}s after HTTP {r.status_code}")
+            r.close()
+            if self.on_status:
+                self.on_status(f"{self.label} is busy; trying again in {wait:.0f} s…")
+            end = time.time() + wait
+            while time.time() < end:
+                if stopped():
+                    return None
+                time.sleep(0.2)
 
     def extra_body(self) -> dict:
         if self.effort_ok:
@@ -460,6 +646,17 @@ class LocalBackend(OpenAIBackend):
         self.context_tokens = context_tokens
         self.max_tokens = min(4096, context_tokens // 4)      # stop runaway replies filling the memory
         self.local = True
+
+    @property
+    def budget_tokens(self) -> int:
+        """Send only as much chat as this PC reads in about a minute and a half (the engine re-reads
+        whatever isn't cached, e.g. a long saved chat after a restart), and never more than fits."""
+        from .engine import SPEED
+        cap = int(self.context_tokens * 0.6)
+        tps = SPEED.get("prompt_tps") or 0
+        if not tps:
+            return min(cap, 6000)
+        return int(min(cap, max(4000, tps * 90 // 2000 * 2000)))     # in steps, so it stays put between turns
 
     def extra_body(self) -> dict:
         think = self.speed == "thorough"
@@ -478,15 +675,106 @@ class LocalBackend(OpenAIBackend):
 
     def stream(self, *a, **k):
         try:
-            return super().stream(*a, **k)
+            turn = super().stream(*a, **k)
         except requests.ConnectionError:
             raise BackendError("The AFIF Engine isn't running. Pick a model at the top, then try again.")
+        except BackendError as e:
+            if "Can't reach" in str(e):
+                raise BackendError("The AFIF Engine isn't running. Pick a model at the top, then try again.")
+            raise
+        if (self.timing.get("engine_prompt_n") or 0) >= 200 and self.timing.get("engine_prompt_tps"):
+            from .engine import SPEED
+            SPEED["prompt_tps"] = float(self.timing["engine_prompt_tps"])
+        return turn
+
+
+# ---------------------------------------------------------------- Free Auto
+# When a service hits its limit it rests for a while; Free Auto moves on to the next one.
+COOLDOWN: dict[str, float] = {}         # candidate name -> time it can be used again
+
+
+def _rest_for(err: str) -> float:
+    low = err.lower()
+    if "out of credit" in low or "rejected the api key" in low or "sign in to github" in low:
+        return 6 * 3600
+    if "can't use tools" in low:
+        return 24 * 3600
+    if "per day" in low or "daily" in low or "perday" in low or "requests per day" in low:
+        return 3600
+    if "rate limit" in low or "quota" in low or "429" in low or "too large" in low or "413" in low:
+        return 70
+    return 30                           # busy, connection dropped, unknown error
+
+
+class RouterBackend(Backend):
+    """Free Auto: use the free services you've connected one after another. When one is busy, out of
+    quota or rejects the request, the same turn goes to the next (like FreeLLMAPI, but built in).
+    The agent hands it `payload(budget, lean)`, so each service gets a prompt sized to its limits."""
+    label = "Free Auto"
+    router = True
+
+    def __init__(self, candidates: list):
+        super().__init__()
+        self.candidates = candidates    # [(name, factory -> Backend)], best first
+        self.current = None             # backend that answered last
+        self.current_name = ""
+        self.payload = None             # set by the agent: payload(budget, lean) -> (messages, tools)
+        self.model = "free-auto"
+
+    @property
+    def budget_tokens(self):
+        return self.current.budget_tokens if self.current else 6000
+
+    def abort(self):
+        if self.current:
+            self.current.abort()
+
+    def stream(self, messages, tools, temperature, on_text, stopped) -> Turn | None:
+        tried, last = [], ""
+        now = time.time()
+        order = [c for c in self.candidates if COOLDOWN.get(c[0], 0) <= now] or \
+            sorted(self.candidates, key=lambda c: COOLDOWN.get(c[0], 0))[:1]
+        for name, factory in order:
+            if stopped():
+                return None
+            try:
+                b = factory()
+            except BackendError as e:
+                COOLDOWN[name] = time.time() + _rest_for(str(e))
+                tried.append(f"{name}: {e}")
+                continue
+            b.speed, b.on_thinking, b.on_progress, b.on_status = self.speed, self.on_thinking, self.on_progress, \
+                self.on_status
+            b.max_waits = 0 if len(order) > 1 else 2      # don't wait: switch to the next service
+            self.current, self.current_name = b, name
+            said = []
+            msgs, tls = self.payload(b.budget_tokens, b.budget_tokens < 12000 or getattr(b, "local", False))
+            try:
+                turn = b.stream(msgs, tls, temperature, lambda t: (said.append(t), on_text(t)), stopped)
+            except BackendError as e:
+                self.timing = dict(b.timing, model=name)
+                if said:                                   # part of the answer is already shown
+                    raise
+                COOLDOWN[name] = time.time() + _rest_for(str(e))
+                tried.append(f"{name}: {str(e)[:160]}")
+                last = str(e)
+                if self.on_status:
+                    self.on_status(f"{name} isn't available right now; trying the next free model…")
+                from . import diag
+                diag.event("free_auto_switch", level="info", model=name, error=str(e)[:600], request=b.timing)
+                continue
+            self.timing = dict(b.timing, model=name, tried=tried)
+            return turn
+        raise BackendError("Every free model is busy or out of quota right now. Wait a few minutes, connect "
+                           "another free service in Models → Cloud, or pick a model on this PC.\n"
+                           + "\n".join(tried[-6:]) if tried else last or "No free service is connected yet.")
 
 
 # ---------------------------------------------------------------- Anthropic (Claude)
 class AnthropicBackend(Backend):
     label = "Claude"
     vision = True
+    budget_tokens = 60000       # prompt caching makes re-sent history cheap
     URL = "https://api.anthropic.com/v1/messages"
 
     def __init__(self, key: str, model: str):
@@ -569,16 +857,36 @@ class AnthropicBackend(Backend):
         headers = {"x-api-key": self.key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
         t0 = time.perf_counter()
         self.timing = {"host": "api.anthropic.com", "retries": [], "request_chars": len(json.dumps(body))}
-        try:
-            self.resp = HTTP.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
+        waits = 0
+        while True:
+            try:
+                self.resp = post(self.URL, stopped, json=body, headers=headers, stream=True, timeout=(10, 900))
+            except Stopped:
+                self.resp = None
+                return None
+            except requests.ConnectionError:
+                raise BackendError("Can't reach Claude. Check your internet connection.")
             self.timing["headers_s"] = round(time.perf_counter() - t0, 3)
-            if self.resp.status_code == 400 and ("output_config" in self.resp.text or "effort" in self.resp.text):
+            if self.resp.status_code == 400 and "output_config" in body and (
+                    "output_config" in self.resp.text or "effort" in self.resp.text):
                 self.timing["retries"].append("without effort")
                 self.resp.close()                       # older model without effort support
                 body.pop("output_config")
-                self.resp = HTTP.post(self.URL, json=body, headers=headers, stream=True, timeout=(10, 900))
-        except requests.ConnectionError:
-            raise BackendError("Can't reach Claude. Check your internet connection.")
+                continue
+            wait = retry_wait(self.resp) if waits < 2 else 0
+            if not wait:
+                break
+            waits += 1
+            self.timing["retries"].append(f"waited {wait:.0f}s after HTTP {self.resp.status_code}")
+            self.resp.close()
+            if self.on_status:
+                self.on_status(f"Claude is busy; trying again in {wait:.0f} s…")
+            end = time.time() + wait
+            while time.time() < end:
+                if stopped():
+                    self.resp = None
+                    return None
+                time.sleep(0.2)
         blocks: dict[int, dict] = {}
         tin = tout = 0
         event = ""

@@ -162,6 +162,7 @@ class Agent(QObject):
         self.active_mcp = set()
         self.loaded = []
         self.messages = [{"role": "system", "content": self.system_prompt()}]
+        self._cuts = {}
 
     def system_prompt(self, lean: bool | None = None) -> str:
         lean = self._lean if lean is None else lean
@@ -203,6 +204,7 @@ class Agent(QObject):
     def resume(self, data: dict) -> list:
         """Load a saved chat for this project; returns its messages for the UI to redraw."""
         self.messages = [{"role": "system", "content": self.system_prompt()}] + list(data.get("messages", []))
+        self._cuts = {}
         self.loaded = [n for n in data.get("loaded_skills", []) if n in self.skills]
         return self.messages[1:]
 
@@ -278,8 +280,15 @@ class Agent(QObject):
             self._backend.speed = self.s.get("speed", "balanced")
             self._backend.on_thinking = self._on_think
             self._backend.on_progress = lambda done, total: self.progress.emit(done, total)
-            lean = bool(getattr(self._backend, "local", False))
-            if lean != self._lean:                    # small local models get a short prompt: much faster to read
+            self._backend.on_status = self.status.emit
+            self._sys_cache, self._budget_scale = {}, 1.0
+            router = bool(getattr(self._backend, "router", False))
+            if router:
+                self._backend.payload = self._payload
+            # Local models and services with small limits get the short prompt: much faster to read,
+            # and it fits free tiers (Groq, GitHub Models) that allow only a few thousand tokens.
+            lean = router or bool(getattr(self._backend, "local", False)) or self._backend.budget_tokens < 12000
+            if lean != self._lean:
                 self._lean = lean
                 self.messages[0]["content"] = self.system_prompt(lean)
             if lean:
@@ -306,13 +315,13 @@ class Agent(QObject):
             for _ in range(int(self.s.get("max_steps", 40))):
                 if self._stop.is_set():
                     break
-                self._fit_context()
                 try:
                     msg = self._chat_once()
                 except BackendError as e:
-                    if "no longer fits" not in str(e) or not getattr(self._backend, "context_tokens", 0):
+                    if "no longer fits" not in str(e) and "too large" not in str(e):
                         raise
-                    self._fit_context(0.45, keep=1)       # trim harder and try once more
+                    self._budget_scale = 0.5              # send less history and try once more
+                    self.status.emit("The chat was too long for this model; sending a shorter part of it…")
                     msg = self._chat_once()
                 if msg is None:
                     break
@@ -392,7 +401,11 @@ class Agent(QObject):
     def _chat_once_inner(self) -> dict | None:
         self.turn_started.emit()
         self.status.emit("Reading your message…" if self._lean else "Waiting for the model…")
-        turn = self._backend.stream(self.messages, self._schemas(), float(self.s.get("temperature", 0.2)),
+        if getattr(self._backend, "router", False):
+            msgs, tools = None, None              # Free Auto sizes the prompt for each service it tries
+        else:
+            msgs, tools = self._payload(self._backend.budget_tokens, self._lean)
+        turn = self._backend.stream(msgs, tools, float(self.s.get("temperature", 0.2)),
                                     self._on_text, self._stop.is_set)
         if turn is None:
             return None
@@ -428,8 +441,9 @@ class Agent(QObject):
         self._mark_first()
         self.thinking_delta.emit(t)
 
-    def _schemas(self) -> list[dict]:
-        out = Toolbox.schemas(drive=drive_connected(), skills=bool(self.skills), compact=self._lean)
+    def _schemas(self, lean: bool | None = None) -> list[dict]:
+        lean = self._lean if lean is None else lean
+        out = Toolbox.schemas(drive=drive_connected(), skills=bool(self.skills), compact=lean)
         for name in sorted(self.active_mcp):
             srv = self.mcp.running.get(name)
             if srv and srv.alive():
@@ -549,33 +563,80 @@ class Agent(QObject):
         self.tool_finished.emit(call_id, ok, out)
         self._reply(call_id, out, images)
 
-    def _fit_context(self, share: float = 0.7, keep: int = 2):
-        """Local models have a small memory: trim old tool output when the chat gets near the limit."""
-        limit = getattr(self._backend, "context_tokens", 0)
-        if not limit:
-            return
+    # ---------------------------------------------------------------- what is sent each turn
+    @staticmethod
+    def _tokens(m: dict) -> float:
+        """Rough token count of one message (pictures count as about 1,000 tokens)."""
+        c = m.get("content")
+        if isinstance(c, list):
+            n = sum(len(p.get("text", "")) if p.get("type") == "text" else 3200 for p in c)
+        else:
+            n = len(c or "")
+        if m.get("tool_calls"):
+            n += len(json.dumps(m["tool_calls"]))
+        n += 3200 * len(m.get("_images") or [])
+        return n / 3.2 + 4
 
-        def size():
-            return sum(len(m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")))
-                       + len(json.dumps(m.get("tool_calls", ""))) for m in self.messages) / 3.2
+    def _payload(self, budget: float, lean: bool) -> tuple[list, list]:
+        """The prompt for one turn: instructions, tools and as much recent chat as fits `budget` tokens.
+        The full chat stays in memory and on disk; only this copy is shortened. Sending the whole
+        history every turn made each Gemini step re-send ~45,000 tokens (slow, and it used up the free
+        quota in a few minutes); a long saved chat took a slow PC minutes to re-read."""
+        cache = getattr(self, "_sys_cache", None)
+        if cache is None:
+            cache = self._sys_cache = {}
+        if lean not in cache:
+            cache[lean] = self.system_prompt(lean)
+        system = {"role": "system", "content": cache[lean]}
+        tools = self._schemas(lean)
+        budget = budget * getattr(self, "_budget_scale", 1.0)
+        avail = max(1200.0, budget - self._tokens(system) - len(json.dumps(tools)) / 3.5)
+        return [system] + self._view(avail, lean), tools
 
-        budget = limit * share
-        if size() <= budget:
-            return
-        tool_idx = [i for i, m in enumerate(self.messages) if m["role"] == "tool"]
-        for i in tool_idx[:-keep]:                       # keep the latest results intact
-            m = self.messages[i]
-            if len(m["content"]) > 200:
-                m["content"] = m["content"][:160] + "\n[older output trimmed to save memory]"
-            if size() <= budget:
-                return
-        for m in self.messages[1:-1]:                    # then long replies and attachments, oldest first
+    def _view(self, avail: float, lean: bool) -> list[dict]:
+        msgs = self.messages[1:]
+        keep, cap = (3, 500) if lean else (6, 2000)
+        tool_idx = [i for i, m in enumerate(msgs) if m["role"] == "tool"]
+        old_tools = set(tool_idx[:-keep])
+        out = []
+        for i, m in enumerate(msgs):
             c = m.get("content")
-            if isinstance(c, str) and len(c) > 1500:
-                m["content"] = c[:1200] + "\n[trimmed to save memory]"
-            if size() <= budget:
-                return
-        self.status.emit("This chat is near the model's memory limit. Consider starting a new chat.")
+            if i in old_tools and isinstance(c, str) and len(c) > cap:
+                m = dict(m, content=c[:int(cap * 0.8)] + "\n[older output shortened to save tokens; run the tool "
+                                                          "again if you need it]")
+                m.pop("_images", None)
+            elif i < len(msgs) - 4 and isinstance(c, str) and len(c) > cap * 3 and m["role"] != "tool":
+                m = dict(m, content=c[:cap * 2] + "\n[shortened to save tokens]")
+            out.append(m)
+        sizes = [self._tokens(m) for m in out]
+        total = sum(sizes)
+        cuts = getattr(self, "_cuts", None)
+        if cuts is None:
+            cuts = self._cuts = {}
+        key = (int(avail) // 500, lean)        # one cut point per service size (Free Auto mixes them)
+        if total <= avail:
+            cuts.pop(key, None)
+            return out
+        # Leave out the oldest part. Cut only where a user or assistant message starts, so a tool result
+        # never loses the call it answers. Keep the cut point while it still fits: the engine's and
+        # Claude's prompt caches then stay valid from one turn to the next.
+        starts = [i for i, m in enumerate(out) if i > 0 and m["role"] in ("user", "assistant")]
+        cut = cuts.get(key, 0)
+        if not (cut in starts and sum(sizes[cut:]) <= avail):
+            target = avail * 0.65
+            cut = next((i for i in starts if sum(sizes[i:]) <= target), starts[-1] if starts else 0)
+            cuts[key] = cut
+        request = next((m.get("content") for m in reversed(out) if m["role"] == "user"
+                        and isinstance(m.get("content"), str) and not m["content"].startswith("[AFIF Coder")), "")
+        note = ("[AFIF Coder: older messages of this chat were left out to save tokens. The progress notes in "
+                "your instructions summarise earlier work."
+                + (f" The user's latest request: \u00ab{request[:600]}\u00bb" if request else "") + "]")
+        rest = out[cut:]
+        if rest and rest[0]["role"] == "user" and isinstance(rest[0].get("content"), str):
+            rest[0] = dict(rest[0], content=note + "\n\n" + rest[0]["content"])
+        else:
+            rest.insert(0, {"role": "user", "content": note})
+        return rest
 
     def _reply(self, call_id: str, content: str, images: list | None = None):
         m = {"role": "tool", "tool_call_id": call_id, "content": content}

@@ -15,11 +15,38 @@ import threading
 import time
 from pathlib import Path
 
+import json
+import re
+
 import requests
 from PySide6.QtCore import QObject, Signal
 
 from . import diag
 from .paths import app_base, data_dir
+
+# Measured prompt-reading speed of the running engine (tokens/s). The agent sizes the chat history
+# it sends from this, so a slow PC isn't kept waiting minutes for an old chat to be re-read.
+SPEED = {"prompt_tps": 0.0}
+
+
+def _choices_file() -> Path:
+    return data_dir() / "gpu_choice.json"
+
+
+def _load_choices() -> dict:
+    try:
+        return json.loads(_choices_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_choice(gpu: str, rec: dict):
+    d = _load_choices()
+    d[gpu] = rec
+    try:
+        _choices_file().write_text(json.dumps(d, indent=1), encoding="utf-8")
+    except OSError:
+        pass
 
 EXE = "llama-server.exe" if sys.platform == "win32" else "llama-server"
 
@@ -97,6 +124,7 @@ class Engine(QObject):
         self._job = _KillOnClose()
         self._lock = threading.Lock()
         self._gen = 0
+        self.ctx_effective = 0     # context the engine really uses (capped to what the model was trained on)
 
     @property
     def url(self) -> str:
@@ -125,31 +153,116 @@ class Engine(QObject):
         if not builds:
             self._emit("failed", "The AFIF Engine files are missing. Reinstall AFIF Coder.")
             return
+        known = _load_choices()
+        if any(v.get("choice") == "cpu" for v in known.values()) and len(builds) > 1:
+            builds = [b for b in builds if b[0] != "vulkan"] + [b for b in builds if b[0] == "vulkan"]
         last_err = ""
         try:
             size_gb = round(Path(model_path).stat().st_size / 1024 ** 3, 2)
         except OSError:
             size_gb = 0
         for backend, exe in builds:
-            if gen != self._gen:
-                return
-            self._emit("loading", f"Loading {name} ({'GPU' if backend == 'vulkan' else 'CPU'})…")
-            t0 = time.time()
-            err = self._launch(gen, exe, backend, model_path, ctx)
-            secs = round(time.time() - t0, 2)
+            use_ctx = ctx
+            while True:
+                if gen != self._gen:
+                    return
+                self._emit("loading", f"Loading {name} ({'GPU' if backend == 'vulkan' else 'CPU'})…")
+                t0 = time.time()
+                err = self._launch(gen, exe, backend, model_path, use_ctx)
+                secs = round(time.time() - t0, 2)
+                if err is None:
+                    break
+                if err != "cancelled":
+                    diag.event("engine_load", level="error", model=name, backend=backend, seconds=secs,
+                               size_gb=size_gb, context=use_ctx, error=err, engine_log=self._log_tail(40))
+                self.stop(keep_gen=True)
+                if err.startswith("Not enough memory") and use_ctx > 8192:
+                    use_ctx = max(8192, use_ctx // 2)        # try again with a smaller context
+                    continue
+                break
             if err is None:
+                self._read_props(use_ctx)
                 diag.event("engine_load", level="slow" if secs >= diag.SLOW["engine_load"] else "info",
-                           model=name, backend=backend, seconds=secs, size_gb=size_gb, context=ctx)
+                           model=name, backend=backend, seconds=secs, size_gb=size_gb, context=use_ctx,
+                           context_used=self.ctx_effective, gpu=self.gpu_name())
                 self.model, self.backend = model_path, backend
-                self._emit("ready", f"{name} on {'GPU' if backend == 'vulkan' else 'CPU'}")
+                rec = next(iter(known.values()), {}) if known else {}
+                SPEED["prompt_tps"] = float(rec.get(backend) or 0)
+                if backend == "vulkan" and len(builds) > 1 and self._maybe_cpu_faster(gen, model_path, use_ctx):
+                    return
+                note = "" if use_ctx == ctx else f" (context lowered to {use_ctx} to fit in memory)"
+                self._emit("ready", f"{name}{note} on {'GPU' if self.backend == 'vulkan' else 'CPU'}")
                 return
             last_err = err
-            if err != "cancelled":
-                diag.event("engine_load", level="error", model=name, backend=backend, seconds=secs, size_gb=size_gb,
-                           context=ctx, error=err, engine_log=self._log_tail(40))
-            self.stop(keep_gen=True)
         if gen == self._gen:
             self._emit("failed", last_err)
+
+    def _read_props(self, asked: int):
+        self.ctx_effective = asked
+        try:
+            p = requests.get(f"{self.url}/props", timeout=5).json()
+            n = (p.get("default_generation_settings") or {}).get("n_ctx") or p.get("n_ctx")
+            if n:
+                self.ctx_effective = int(n)
+        except (requests.RequestException, ValueError, AttributeError):
+            pass
+
+    def gpu_name(self) -> str:
+        m = re.search(r"ggml_vulkan: 0 = (.+?) \|", self._log_tail(400))
+        return m.group(1).strip() if m else ""
+
+    def bench(self) -> float:
+        """Prompt-reading speed in tokens/s, measured on ~300 tokens."""
+        text = " ".join(f"line {i}: the quick brown fox jumps over the lazy dog." for i in range(30))
+        try:
+            r = requests.post(f"{self.url}/completion", json={"prompt": text, "n_predict": 1, "cache_prompt": False},
+                              timeout=180)
+            return float((r.json().get("timings") or {}).get("prompt_per_second") or 0)
+        except (requests.RequestException, ValueError):
+            return 0.0
+
+    def _maybe_cpu_faster(self, gen, model_path: str, ctx: int) -> bool:
+        """Built-in graphics (shared memory) are often slower than the processor. Measure both once
+        per graphics chip and keep the faster; the result is remembered in gpu_choice.json."""
+        tail = self._log_tail(400)
+        gpu = self.gpu_name()
+        if not gpu or "uma: 1" not in tail:
+            SPEED["prompt_tps"] = 0.0
+            return False                                  # a real graphics card: keep it
+        known = _load_choices().get(gpu)
+        if known and known.get("choice") == "vulkan":
+            SPEED["prompt_tps"] = float(known.get("vulkan") or 0)
+            return False
+        self._emit("loading", "Checking whether the graphics chip or the processor is faster (once)…")
+        gpu_tps = self.bench()
+        cpu = next(((b, e) for b, e in backends() if b == "cpu"), None)
+        if not cpu or gen != self._gen:
+            return False
+        self.stop(keep_gen=True)
+        err = self._launch(gen, cpu[1], "cpu", model_path, ctx)
+        if err is not None:
+            self.stop(keep_gen=True)
+            self._emit("loading", "Going back to the graphics chip…")
+            if self._launch(gen, backends()[0][1], "vulkan", model_path, ctx) is None:
+                self._emit("ready", f"{Path(model_path).stem} on GPU")
+                return True
+            return False
+        cpu_tps = self.bench()
+        choice = "cpu" if cpu_tps >= gpu_tps * 0.9 else "vulkan"
+        _save_choice(gpu, {"vulkan": round(gpu_tps, 1), "cpu": round(cpu_tps, 1), "choice": choice})
+        diag.event("engine_bench", gpu=gpu, gpu_tokens_per_s=round(gpu_tps, 1), cpu_tokens_per_s=round(cpu_tps, 1),
+                   choice=choice)
+        if choice == "vulkan":
+            self.stop(keep_gen=True)
+            if self._launch(gen, backends()[0][1], "vulkan", model_path, ctx) is not None:
+                return False
+            SPEED["prompt_tps"] = gpu_tps
+        else:
+            self.backend = "cpu"
+            SPEED["prompt_tps"] = cpu_tps
+        self._read_props(ctx)
+        self._emit("ready", f"{Path(model_path).stem} on {'GPU' if choice == 'vulkan' else 'CPU'}")
+        return True
 
     def _launch(self, gen, exe: Path, backend: str, model_path: str, ctx: int) -> str | None:
         self.port = _free_port()
