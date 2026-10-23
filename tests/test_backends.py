@@ -520,6 +520,20 @@ ac = Agent({}, None); ac.reset(str(project())); ac._lean = False
 ac._auto_skills("can you clone apps")
 check(len(ac.messages[-1]["content"]) > 5000, "cloud models still get the full skill")
 
+print("Errors in Gemini's list format")
+class GErr(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(429); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(json.dumps([{"error": {"code": 429, "message": "Resource has been exhausted (e.g. check quota).",
+                                                 "status": "RESOURCE_EXHAUSTED"}}]).encode())
+ge = serve(GErr, "gerr")
+gb = backends.make_backend("gemini", "gemini-3.8-flash", {"key": "g", "base_url": ge})
+out, _ = run_agent(gb, str(project()), "hi")
+check("quota" in (out.get("err") or "") and "AttributeError" not in (out.get("err") or ""),
+      f"a Gemini error shows its real message ({out.get('err')})")
+
 print("Key storage")
 enc = backends.protect("sk-secret-123")
 check(enc and "sk-secret" not in enc and backends.unprotect(enc) == "sk-secret-123",

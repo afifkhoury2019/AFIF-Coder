@@ -119,15 +119,22 @@ def list_models(provider_id: str, cfg: dict) -> list[str]:
         raise BackendError(f"{p.label} didn't answer in time.")
 
 
+def _unwrap(j):
+    """Some services send a JSON list where others send an object; use the first object."""
+    while isinstance(j, list):
+        j = j[0] if j else {}
+    return j if isinstance(j, dict) else {"message": str(j)}
+
+
 def _raise_for(r, label: str):
     if r.status_code == 200:
         return
     try:
-        j = r.json()
+        j = _unwrap(r.json())                     # Gemini wraps errors in a list: [{"error": {...}}]
         err = j.get("error")
         msg = err.get("message") if isinstance(err, dict) else (err or j.get("message") or r.text)
-        if isinstance(j, list) and j and isinstance(j[0], dict):        # Gemini sometimes wraps in a list
-            msg = j[0].get("error", {}).get("message", msg)
+        if isinstance(err, dict) and err.get("status"):
+            msg = f"{msg} [{err['status']}]"
     except ValueError:
         msg = r.text[:300]
     low = str(msg).lower()
@@ -340,7 +347,7 @@ class OpenAIBackend(Backend):
                 data = raw[5:].strip()
                 if data == b"[DONE]":
                     break
-                chunk = json.loads(data)
+                chunk = _unwrap(json.loads(data))
                 if chunk.get("error"):
                     e = chunk["error"]
                     raise BackendError(str(e.get("message", e) if isinstance(e, dict) else e))
@@ -545,7 +552,7 @@ class AnthropicBackend(Backend):
                     continue
                 if not raw.startswith(b"data:"):
                     continue
-                d = json.loads(raw[5:].strip())
+                d = _unwrap(json.loads(raw[5:].strip()))
                 t = d.get("type", event)
                 if t == "error":
                     e = d.get("error", {})
