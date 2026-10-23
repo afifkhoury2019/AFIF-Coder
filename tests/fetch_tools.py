@@ -106,7 +106,9 @@ VERSIONS["REA (rea-agents)"] = pkg["version"]
 r = get("https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse",
         allow_redirects=True)
 unzip_to(r.content, T / "jdk")
-VERSIONS["Temurin JDK"] = Path(r.url).name
+cd = r.headers.get("Content-Disposition", "")
+m = re.search(r'filename="?([^";]+)', cd) or re.search(r"filename%3D([^&]+)", r.url)
+VERSIONS["Temurin JDK"] = (m.group(1) if m else "21 (latest GA)").replace("OpenJDK21U-jdk_x64_windows_hotspot_", "21 build ").replace(".zip", "")
 
 # --- JADX headless MCP JAR (pinned by REA) ---
 jar = get(JADX_URL).content
