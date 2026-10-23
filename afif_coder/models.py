@@ -35,7 +35,7 @@ CATALOG = [
      "about": "Stronger reasoning across several files. Needs a good GPU or plenty of RAM.",
      "file": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
      "repo": "bartowski/Qwen2.5-Coder-14B-Instruct-GGUF"},
-    {"id": "qwen3-coder-30b", "name": "Qwen3 Coder 30B-A3B", "size": 18.6, "ram": 32,
+    {"id": "qwen3-coder-30b", "name": "Qwen3 Coder 30B-A3B", "size": 17.3, "ram": 32,
      "about": "The strongest option. Mixture-of-experts, so it's quicker than its size suggests.",
      "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
      "repo": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",

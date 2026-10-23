@@ -36,26 +36,7 @@ jobs:
       - name: Fetch AFIF Engine (llama.cpp CPU + Vulkan builds)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          $rel = gh api repos/ggml-org/llama.cpp/releases/latest | ConvertFrom-Json
-          Write-Host "llama.cpp release: $($rel.tag_name)"
-          foreach ($kind in "cpu", "vulkan") {
-            $asset = $rel.assets | Where-Object { $_.name -match "bin-win-$kind-x64\.zip$" } | Select-Object -First 1
-            if (-not $asset) { throw "No win-$kind-x64 build in $($rel.tag_name)" }
-            Write-Host "  $kind -> $($asset.name)"
-            Invoke-WebRequest $asset.browser_download_url -OutFile "$kind.zip"
-            Expand-Archive "$kind.zip" -DestinationPath "engine\$kind" -Force
-            $srv = Get-ChildItem "engine\$kind" -Recurse -Filter llama-server.exe | Select-Object -First 1
-            if (-not $srv) { throw "llama-server.exe missing from $kind build" }
-            if ($srv.DirectoryName -ne (Resolve-Path "engine\$kind").Path) {   # flatten if zipped in a subfolder
-              Get-ChildItem $srv.DirectoryName | Move-Item -Destination "engine\$kind" -Force
-            }
-            # keep only what the server needs
-            Get-ChildItem "engine\$kind" -Filter *.exe | Where-Object { $_.Name -ne "llama-server.exe" } | Remove-Item
-          }
-          Invoke-WebRequest "https://raw.githubusercontent.com/ggml-org/llama.cpp/$($rel.tag_name)/LICENSE" -OutFile engine\LICENSE-llama.cpp.txt
-          "$($rel.tag_name)" | Out-File engine\VERSION.txt
-          Get-ChildItem engine -Recurse | Measure-Object Length -Sum | ForEach-Object { "Engine size: {0:N0} MB" -f ($_.Sum / 1MB) }
+        run: python tests/fetch_engine.py
 
       - name: Cache test model
         uses: actions/cache@v4
