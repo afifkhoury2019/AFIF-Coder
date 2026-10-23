@@ -36,6 +36,48 @@ CLAIM = re.compile(r"\b(i|i've|i have)\s+(used|edited|updated|fixed|changed|crea
 TEXT_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 
 
+TOOL_NAMES = {t["function"]["name"] for t in Toolbox.schemas()}
+FENCE = re.compile(r"```[a-zA-Z]*\s*(.*?)```", re.S)
+
+
+def extract_text_calls(text: str) -> tuple[list[tuple[str, dict]], str]:
+    """Find tool calls a model wrote as text: <tool_call>{..}</tool_call>, ```json {..}```, or bare JSON.
+
+    Returns the calls and the text with those calls removed.
+    """
+    dec = json.JSONDecoder()
+    calls, spans = [], []
+    i = 0
+    while True:
+        i = text.find("{", i)
+        if i < 0:
+            break
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict) and obj.get("name") in TOOL_NAMES:
+            args = obj.get("arguments", obj.get("parameters", {}))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = None
+            if isinstance(args, dict):
+                calls.append((obj["name"], args))
+                spans.append((i, end))
+        i = end if end > i else i + 1
+    if not calls:
+        return [], text
+    for a, b in reversed(spans):
+        text = text[:a] + text[b:]
+    text = TEXT_CALL.sub("", text)
+    text = re.sub(r"</?tool_call>", "", text)
+    text = FENCE.sub(lambda m: "" if not m.group(1).strip() else m.group(0), text)
+    return calls, text.strip()
+
+
 class EngineError(Exception):
     pass
 
@@ -178,16 +220,9 @@ class Agent(QObject):
             self._resp = None
         text = "".join(content)
         if not calls:                       # model wrote the call as text instead
-            for i, m in enumerate(TEXT_CALL.finditer(text)):
-                try:
-                    j = json.loads(m.group(1))
-                    args = j.get("arguments", j.get("parameters", {}))
-                    calls[i] = {"id": "", "name": j.get("name", ""),
-                                "arguments": args if isinstance(args, str) else json.dumps(args)}
-                except ValueError:
-                    pass
-            if calls:
-                text = TEXT_CALL.sub("", text).strip()
+            found, text = extract_text_calls(text)
+            for i, (name, args) in enumerate(found):
+                calls[i] = {"id": "", "name": name, "arguments": json.dumps(args)}
         msg = {"role": "assistant", "content": text}
         if calls:
             n = len(self.messages)

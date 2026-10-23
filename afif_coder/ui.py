@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .agent import TEXT_CALL, Agent
+from .agent import Agent, extract_text_calls
 from .engine import Engine
 from .models import Downloader, ModelsDialog, display_name, installed_models
 from .paths import data_dir
@@ -620,7 +620,7 @@ class MainWindow(QMainWindow):
     def _flush_reply(self):
         self.flush.stop()
         if self.reply is not None:
-            shown = TEXT_CALL.sub("", self.reply_buf)
+            shown = extract_text_calls(self.reply_buf)[1]
             if "<tool_call>" in shown:                    # still streaming a text-style call
                 shown = shown[: shown.index("<tool_call>")]
             if self.reply.raw != shown:
