@@ -1,0 +1,21 @@
+AFIF Coder
+Copyright (c) 2026 AFIF-TECH. All rights reserved.
+
+AFIF Coder runs entirely on your computer. It does not send your code, files or
+prompts anywhere. The only network access is downloading models you choose in the
+Models window, from Hugging Face.
+
+The software is provided "as is", without warranty of any kind. AFIF Coder can
+change files and run commands in the project folder you open; changes are shown
+for your approval unless you turn approval off. Keep backups of important work.
+
+Third-party components included:
+
+- AFIF Engine is built on llama.cpp (https://github.com/ggml-org/llama.cpp),
+  Copyright (c) 2023-2026 The ggml authors, MIT License. Its full licence text is
+  installed in the engine folder.
+- Qt for Python (PySide6), LGPL v3, The Qt Company.
+- Python, PSF License. requests, Apache License 2.0.
+
+Models you download are made by their authors (for example Qwen, Apache 2.0)
+and are covered by their own licences.

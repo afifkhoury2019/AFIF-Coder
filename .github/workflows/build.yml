@@ -1,0 +1,131 @@
+name: Build AFIF Coder installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APP_VERSION: "1.0.0"
+  TEST_MODEL_URL: https://huggingface.co/bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Check model download links
+        run: python tests/check_model_links.py
+
+      - name: Fetch AFIF Engine (llama.cpp CPU + Vulkan builds)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $rel = gh api repos/ggml-org/llama.cpp/releases/latest | ConvertFrom-Json
+          Write-Host "llama.cpp release: $($rel.tag_name)"
+          foreach ($kind in "cpu", "vulkan") {
+            $asset = $rel.assets | Where-Object { $_.name -match "bin-win-$kind-x64\.zip$" } | Select-Object -First 1
+            if (-not $asset) { throw "No win-$kind-x64 build in $($rel.tag_name)" }
+            Write-Host "  $kind -> $($asset.name)"
+            Invoke-WebRequest $asset.browser_download_url -OutFile "$kind.zip"
+            Expand-Archive "$kind.zip" -DestinationPath "engine\$kind" -Force
+            $srv = Get-ChildItem "engine\$kind" -Recurse -Filter llama-server.exe | Select-Object -First 1
+            if (-not $srv) { throw "llama-server.exe missing from $kind build" }
+            if ($srv.DirectoryName -ne (Resolve-Path "engine\$kind").Path) {   # flatten if zipped in a subfolder
+              Get-ChildItem $srv.DirectoryName | Move-Item -Destination "engine\$kind" -Force
+            }
+            # keep only what the server needs
+            Get-ChildItem "engine\$kind" -Filter *.exe | Where-Object { $_.Name -ne "llama-server.exe" } | Remove-Item
+          }
+          Invoke-WebRequest "https://raw.githubusercontent.com/ggml-org/llama.cpp/$($rel.tag_name)/LICENSE" -OutFile engine\LICENSE-llama.cpp.txt
+          "$($rel.tag_name)" | Out-File engine\VERSION.txt
+          Get-ChildItem engine -Recurse | Measure-Object Length -Sum | ForEach-Object { "Engine size: {0:N0} MB" -f ($_.Sum / 1MB) }
+
+      - name: Cache test model
+        uses: actions/cache@v4
+        with:
+          path: testmodel
+          key: testmodel-qwen25coder-1.5b-q4km
+
+      - name: Engine + agent smoke test with a real model
+        run: |
+          if (-not (Test-Path testmodel\test.gguf)) {
+            New-Item -ItemType Directory -Force testmodel | Out-Null
+            Invoke-WebRequest $env:TEST_MODEL_URL -OutFile testmodel\test.gguf
+          }
+          $env:AFIF_ENGINE = (Resolve-Path engine\cpu\llama-server.exe).Path
+          $env:AFIF_DATA = "$env:RUNNER_TEMP\afifdata"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          python tests/smoke_engine.py testmodel\test.gguf
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:AFIF_DATA\engine.log" -Tail 40; exit 1 }
+
+      - name: Build app (PyInstaller, one folder)
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed --name "AFIF-Coder"
+          --icon icon.ico --add-data "afif_coder/icon.png;afif_coder"
+          --version-file installer/version.txt
+          --exclude-module tkinter
+          --exclude-module PySide6.QtWebEngineCore --exclude-module PySide6.QtWebEngineWidgets
+          --exclude-module PySide6.Qt3DCore --exclude-module PySide6.QtMultimedia
+          --exclude-module PySide6.QtQuick --exclude-module PySide6.QtQml --exclude-module PySide6.QtPdf
+          main.py
+
+      - name: Self-test the built app
+        run: |
+          $env:AFIF_DATA = "$env:RUNNER_TEMP\afifdata2"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process dist\AFIF-Coder\AFIF-Coder.exe -ArgumentList "--selftest","$env:RUNNER_TEMP\shot.png" -PassThru -Wait
+          if ($p.ExitCode -ne 0 -or -not (Test-Path "$env:RUNNER_TEMP\shot.png")) { throw "App self-test failed (exit $($p.ExitCode))" }
+          Copy-Item "$env:RUNNER_TEMP\shot.png" dist\selftest.png
+
+      - name: Build installer (Inno Setup)
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$env:APP_VERSION installer\AFIF-Coder.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Test install and uninstall
+        run: |
+          $setup = "dist\AFIF-Coder-Setup-$env:APP_VERSION.exe"
+          $dir = "$env:RUNNER_TEMP\AFIFInstall"
+          Start-Process $setup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/CURRENTUSER","/DIR=$dir" -Wait
+          foreach ($f in "AFIF-Coder.exe", "engine\cpu\llama-server.exe", "engine\vulkan\llama-server.exe") {
+            if (-not (Test-Path "$dir\$f")) { throw "Installed copy is missing $f" }
+          }
+          Start-Process "$dir\unins000.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES" -Wait
+          Start-Sleep 3
+          if (Test-Path "$dir\AFIF-Coder.exe") { throw "Uninstall left files behind" }
+          "{0:N0} MB" -f ((Get-Item $setup).Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AFIF-Coder-Setup
+          path: |
+            dist/AFIF-Coder-Setup-*.exe
+            dist/selftest.png
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION }}
+          name: AFIF Coder ${{ env.APP_VERSION }}
+          make_latest: true
+          files: dist/AFIF-Coder-Setup-*.exe
+          body: |
+            Windows 10/11 (64-bit) installer. Download **AFIF-Coder-Setup-${{ env.APP_VERSION }}.exe**, run it, then pick a model in the Models window on first start.
