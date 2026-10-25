@@ -52,8 +52,16 @@ Keep shared notes current with update_progress. Load a matching skill with use_s
 
 NUDGE = ("You described a change but did not call any tool, so nothing changed on disk. "
          "Call the needed tool now (for example read_file, then edit_file).")
+# Weak models fail to act on a task in two different ways: claiming a change already happened
+# (CLAIM: "I've created the file"), or only describing a plan without ever calling a tool for it
+# (PLAN: "Let me create...", "Here's what I'll do", or a numbered list of steps like "1. Create a
+# folder... 2. Add a file..."). Both leave the user thinking something happened when nothing did.
 CLAIM = re.compile(r"\b(i|i've|i have)\s+(used|edited|updated|fixed|changed|created|wrote|written|"
                    r"modified|replaced|ran|run)\b|\b(edit_file|write_file|run_command)\b", re.I)
+_ACTION_VERBS = r"(create|write|edit|add|build|make|set ?up|generate|implement|fix|update|install|run|place|put|modify|change)"
+PLAN = re.compile(r"\b(let me|i'll|i will|i am going to|i'm going to|here'?s what i(?:'ll| will)?)\b"
+                  r"[^.\n]{0,60}\b" + _ACTION_VERBS + r"\b", re.I)
+NUMBERED_STEPS = re.compile(r"(?:^|\n)\s*\d+[.)]\s+[^\n]{0,80}\b" + _ACTION_VERBS + r"\b", re.I)
 TEXT_CALL = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.S)
 
 
@@ -339,8 +347,11 @@ class Agent(QObject):
                     self.messages.append(msg)
                     calls = msg.get("tool_calls") or []
                     if not calls:
-                        # weak models sometimes claim an action without calling the tool
-                        if not nudged and not used_tools and CLAIM.search(msg.get("content") or ""):
+                        # weak models sometimes claim an action already happened, or only describe a
+                        # plan ("Let me create...", a numbered list of steps) without ever calling a tool
+                        reply = msg.get("content") or ""
+                        if not nudged and not used_tools and (CLAIM.search(reply) or PLAN.search(reply)
+                                or len(NUMBERED_STEPS.findall(reply)) >= 2):
                             nudged = True
                             self.messages.append({"role": "user", "content": NUDGE})
                             continue
