@@ -82,6 +82,42 @@ def environment(engine_url: str) -> dict:
     return e
 
 
+def account_environment(oauth_token: str = "", api_key: str = "") -> dict:
+    """Claude Code on the real Claude with the user's own account: a Claude subscription (Pro/Max,
+    through a sign-in token from `claude setup-token`) or API credit (an API key). No local model."""
+    e = tooling.env()
+    for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+              "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+              "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
+        e.pop(k, None)
+    e.update({"DISABLE_AUTOUPDATER": "1", "CLAUDE_CONFIG_DIR": str(home() / "config-account")})
+    if oauth_token:
+        e["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+    elif api_key:
+        e["ANTHROPIC_API_KEY"] = api_key
+    bash = tooling.tools_dir() / "git" / "usr" / "bin" / "bash.exe"
+    if WIN and bash.is_file():
+        e["CLAUDE_CODE_GIT_BASH_PATH"] = str(bash)
+    return e
+
+
+def open_sign_in() -> None:
+    """Open `claude setup-token` in a console window: the user approves in the browser, and Claude
+    Code prints a long-lived sign-in token for their subscription to paste into AFIF Coder."""
+    cmd = native_exe() or exe()
+    if cmd is None:
+        raise RuntimeError("Claude Code isn't installed yet.")
+    env = account_environment()
+    if WIN:
+        subprocess.Popen(f'cmd.exe /k "title Sign in to Claude & "{cmd}" setup-token"', env=env,
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        term = next((t for t in ("x-terminal-emulator", "gnome-terminal", "xterm") if tooling.which(t)), None)
+        if not term:
+            raise RuntimeError(f"Run this in a terminal, then paste the token: {cmd} setup-token")
+        subprocess.Popen([term, "-e", f"{cmd} setup-token"], env=env)
+
+
 def launch(project: str, engine_url: str) -> None:
     """Open Claude Code in its own console window, in the project folder."""
     cmd = exe()
@@ -152,12 +188,14 @@ class Run:
     ("text", str), ("thinking", str), ("tool", (id, name, summary)), ("tool_done", (id, ok, output)),
     ("status", str). Returns the result dict."""
 
-    def __init__(self, project: str, engine_url: str):
+    def __init__(self, project: str, engine_url: str, env: dict | None = None, model: str = "afif-local"):
         self.project, self.engine_url = project, engine_url
+        self.env = env                      # None = the AFIF Engine; else the user's Claude account
+        self.model = model
         self.proc: subprocess.Popen | None = None
 
     def args(self, auto: bool, session: str, lite: bool, partial: bool = True, notes: str = "") -> list[str]:
-        a = command() + ["-p", "--output-format", "stream-json", "--verbose", "--model", "afif-local",
+        a = command() + ["-p", "--output-format", "stream-json", "--verbose", "--model", self.model,
                          "--permission-mode", "bypassPermissions" if auto else "acceptEdits"]
         if partial:
             a.append("--include-partial-messages")
@@ -198,7 +236,7 @@ class Run:
             # cmd.exe ends the argument list at a line break; keep each argument on one line
             args = [" | ".join(x for x in a.splitlines() if x.strip()) if "\n" in a else a for a in args]
         flags = subprocess.CREATE_NO_WINDOW if WIN else 0
-        self.proc = subprocess.Popen(args, cwd=self.project, env=environment(self.engine_url),
+        self.proc = subprocess.Popen(args, cwd=self.project, env=self.env or environment(self.engine_url),
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      creationflags=flags, text=True, encoding="utf-8", errors="replace", bufsize=1)
         err_lines: list[str] = []
@@ -281,16 +319,30 @@ class Harness:
     timing: dict = {}
     on_thinking = on_progress = on_status = None
 
-    def __init__(self, engine_url: str, lite: bool = True):
-        self.engine_url, self.lite = engine_url, lite
+    def __init__(self, engine_url: str = "", lite: bool = True, account: dict | None = None):
+        """account: {"model": "sonnet"|"opus", "oauth_token": ..., "api_key": ...} runs Claude Code on the
+        real Claude with the user's subscription or API credit; otherwise on the AFIF Engine."""
+        self.engine_url, self.lite, self.account = engine_url, lite, account
         self.current: Run | None = None
+        if account:
+            self.lite = False                       # the real Claude gets Claude Code's full setup
+            self.local = False
+            self.budget_tokens = 200000
+            self.label = "Claude Code (your Claude account)"
+
+    def _run_obj(self, project: str) -> "Run":
+        if self.account:
+            env = account_environment(self.account.get("oauth_token", ""), self.account.get("api_key", ""))
+            return Run(project, "", env=env, model=self.account.get("model") or "sonnet")
+        return Run(project, self.engine_url)
 
     def run(self, project: str, text: str, auto: bool, session: str, notes: str, on_event, stopped) -> dict:
         import time
-        self.current = Run(project, self.engine_url)
+        self.current = self._run_obj(project)
         t0 = time.time()
         res = self.current.run(text, auto, session, self.lite, notes, on_event, stopped)
-        self.timing = {"host": self.engine_url, "harness": "claude-code", "lite": self.lite,
+        self.timing = {"host": "api.anthropic.com (your account)" if self.account else self.engine_url,
+                       "harness": "claude-code", "lite": self.lite,
                        "seconds": round(time.time() - t0, 2), "turns": res.get("num_turns"),
                        "usage": res.get("usage"), "result": str(res.get("subtype") or "")}
         return res
@@ -301,7 +353,9 @@ class Harness:
 
     def warm_up(self, project: str, notes: str):
         """Have the engine read Claude Code's instructions once, ahead of the first real message."""
-        r = Run(project, self.engine_url)
+        if self.account:
+            return                                   # no warm-up needed (and it would use the user's quota)
+        r = self._run_obj(project)
         try:
             r.run("Reply with the single word OK.", False, "", self.lite, notes, lambda *a: None, lambda: False)
         except Exception:
