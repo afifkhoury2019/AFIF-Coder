@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from . import skills as skillmod
 from . import tooling
+from .backends import protect, unprotect
 from .tools import DRIVE, drive_connected
 
 
@@ -130,6 +131,19 @@ class ConnectionsDialog(QDialog):
         self.cc.button("Start Claude Code", lambda: (self.claude_code.emit(), self.accept()), primary=True)
         col.addWidget(self.cc)
 
+        self.cca = Card("Claude Code, with your Claude account", "Runs the same Claude Code agent, but against "
+                        "the real Claude on api.anthropic.com using your own Claude.ai subscription (Pro/Max) — "
+                        "the same usage you see in Claude Code or claude.ai, no local model, no API key, no extra "
+                        "bill. Sign in once in your browser; it prints a token to paste below.")
+        self.cca_token = QLineEdit(unprotect(self.s.get("cc_account_token", "")))
+        self.cca_token.setEchoMode(QLineEdit.Password)
+        self.cca_token.setPlaceholderText("Paste the sign-in token Claude Code prints")
+        self.cca.v.insertWidget(2, self.cca_token)
+        self.cca_in = self.cca.button("Sign in in your browser…", self._cc_account_signin, primary=True)
+        self.cca_save = self.cca.button("Save token", self._cc_account_save)
+        self.cca_out = self.cca.button("Remove", self._cc_account_remove)
+        col.addWidget(self.cca)
+
         self.rea = Card("REA (Reverse Engineer Anything)", "Evidence-based analysis of your own APKs, Windows "
                         "programs and Electron apps. Connects automatically when a model loads the REA skill.")
         self.rea.button("Test REA", self._rea_test)
@@ -181,6 +195,8 @@ class ConnectionsDialog(QDialog):
         self.dr.state.setText("Connected" if con else ("Not connected" if have_rc else "rclone not installed"))
         self.dr_in.setVisible(have_rc and not con)
         self.dr_out.setVisible(con)
+        self.cca.state.setText("Connected to your Claude account" if self.s.get("cc_account_token")
+                               else "Not signed in")
         self.rea.state.setText("Installed" if tooling.rea_launcher() else "Not installed")
         rows = []
         for name, use, ok in tooling.inventory():
@@ -314,6 +330,38 @@ class ConnectionsDialog(QDialog):
 
     def _drive_logout(self):
         tooling.run(["rclone", "config", "delete", DRIVE], timeout=30)
+        self.refresh()
+
+    # ---------- Claude Code, with your Claude account ----------
+    def _cc_account_signin(self):
+        from . import claude_code as cc
+        if not cc.installed():
+            QMessageBox.information(self, "Claude Code", "Claude Code isn't installed yet. Click \"Start Claude "
+                                    "Code\" above once (it installs automatically from npm), then come back and "
+                                    "sign in here.")
+            return
+        try:
+            cc.open_sign_in()
+        except Exception as e:
+            QMessageBox.warning(self, "Claude Code", str(e))
+            return
+        QMessageBox.information(self, "Sign in to Claude", "A window just opened and your browser should ask you "
+                                "to approve access to your Claude account. Approve it, then Claude Code prints a "
+                                "long token in that window — copy it, paste it here, and click \"Save token\".")
+
+    def _cc_account_save(self):
+        token = self.cca_token.text().strip()
+        if not token:
+            QMessageBox.warning(self, "Claude Code", "Paste the token first.")
+            return
+        self.s["cc_account_token"] = protect(token)
+        self.refresh()
+        QMessageBox.information(self, "Claude Code", "Saved. Pick \"Claude Code (your Claude account)\" in the "
+                                "model list to use it.")
+
+    def _cc_account_remove(self):
+        self.s.pop("cc_account_token", None)
+        self.cca_token.clear()
         self.refresh()
 
     # ---------- REA ----------

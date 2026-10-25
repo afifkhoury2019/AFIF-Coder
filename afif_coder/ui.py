@@ -850,7 +850,7 @@ class MainWindow(QMainWindow):
         paths = installed_models(self.s["extra_models"])
         clouds = self._cloud_choices()
         want = self.s.get("model", "")
-        if want and not want.startswith(("local:", "cloud:", "auto:", "claudecode:")):
+        if want and want != "claudecode-account" and not want.startswith(("local:", "cloud:", "auto:", "claudecode:")):
             want = "local:" + want                       # settings from 1.0
         self.model.blockSignals(True)
         self.model.clear()
@@ -872,6 +872,9 @@ class MainWindow(QMainWindow):
             header("Claude Code agent: free, on this PC, no API key")
             for p in paths:
                 self.model.addItem("   Claude Code + " + display_name(p), "claudecode:" + str(p))
+        if unprotect(self.s.get("cc_account_token", "")):
+            header("Claude Code agent: your Claude account")
+            self.model.addItem("   Claude Code (your Claude account)", "claudecode-account")
         if free:
             header("Free cloud: daily limits")
             for label, data, _ in free:
@@ -922,6 +925,20 @@ class MainWindow(QMainWindow):
             if not cc.installed():
                 self._install_claude_code()
             return
+        if data == "claudecode-account":
+            from . import claude_code as cc
+            if self.sel == data and not force:
+                return
+            self.sel = data
+            self.engine.stop()                  # no local model needed; this runs on your Claude account
+            self._set_dot("true", "Claude Code", "Using your Claude account (subscription). No local model, "
+                          "no API key — billed to your usual Claude usage.")
+            if not cc.installed():
+                self.status.setText("Installing Claude Code (first time only)…")
+                self._install_claude_code()
+            else:
+                self.status.setText("Claude Code is using your Claude account. Type a task.")
+            return
         if self.sel == data and not force:
             return
         self.sel = data
@@ -971,6 +988,8 @@ class MainWindow(QMainWindow):
         elif self.sel.startswith("claudecode:"):
             self.status.setText("Claude Code is installed. Type a task: it runs here, on this PC's model.")
             self._warm_up()
+        elif self.sel == "claudecode-account":
+            self.status.setText("Claude Code is installed. Type a task: it runs on your Claude account.")
 
     def _set_dot(self, on: str, text: str, tip: str):
         self.dot.setProperty("on", on)
@@ -981,7 +1000,7 @@ class MainWindow(QMainWindow):
         self.dot.setToolTip(tip)
 
     def _on_engine(self, state: str, detail: str):
-        if self.sel.startswith(("cloud:", "auto:")):
+        if self.sel.startswith(("cloud:", "auto:")) or self.sel == "claudecode-account":
             return                             # the engine is idle while a cloud model is chosen
         colours = {"ready": "true", "loading": "wait", "failed": "false", "off": "false"}
         where = " (GPU)" if detail.endswith("on GPU") else (" (CPU)" if detail.endswith("on CPU") else "")
@@ -1015,6 +1034,15 @@ class MainWindow(QMainWindow):
             cfg = dict((self.s.get("cloud") or {}).get(pid) or {})
             cfg["key"] = unprotect(cfg.get("key", ""))
             return make_backend(pid, model, cfg)
+        if sel == "claudecode-account":
+            from . import claude_code as cc
+            if not cc.installed():
+                raise BackendError("Claude Code is still being installed. Wait for \"Claude Code is installed\" "
+                                   "below, then send again.")
+            token = unprotect(self.s.get("cc_account_token", ""))
+            if not token:
+                raise BackendError("Sign in to your Claude account in Connections first.")
+            return cc.Harness(account={"oauth_token": token})
         if self.engine.current != "ready":
             raise BackendError("The local model isn't loaded yet.")
         if sel.startswith("claudecode:"):
